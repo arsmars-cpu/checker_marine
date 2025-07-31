@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Document Forensics AI</title>
+    <style>
+        body { font-family: Arial; background-color: #f0f8ff; padding: 20px; }
+        h1 { color: #333; }
+        .result { margin-top: 20px; padding: 10px; background-color: #fff; border: 1px solid #ccc; }
+        img { max-width: 300px; display: block; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Upload Marine Documents (PDF or Images)</h1>
+    <form method="post" enctype="multipart/form-data">
+        <input type="file" name="file" multiple required>
+        <input type="submit" value="Analyze">
+    </form>
+    {% for original, ela, desc in results %}
+        <div class="result">
+            <strong>File:</strong> {{ original }}<br>
+            <strong>Analysis:</strong> {{ desc }}
+            <img src="{{ url_for('static', filename=ela.split('/')[-1]) }}">
+        </div>
+    {% endfor %}
+</body>
+</html>
