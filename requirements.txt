@@ -1,5 +1,0 @@
-Flask
-Pillow
-PyMuPDF==1.23.2
-opencv-python
-numpy
