@@ -1,0 +1,78 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SeaDoc Checker — Document Forensics AI</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background: #0b1220; color: #e7f1ff; }
+    .card { background: #111a2e; border: 1px solid #223357; }
+    .btn-primary { background: #2a6bf4; border: none; }
+    .badge-ok { background: #0f9960; }
+    .badge-err { background: #c23030; }
+    .muted { color: #9fb3d1; }
+    .dropzone { border: 2px dashed #2a6bf4; border-radius: 10px; padding: 26px; text-align: center; }
+    a, a:hover { color: #9dc1ff; }
+    .small-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace; font-size: 12px; color: #9fb3d1; }
+  </style>
+</head>
+<body>
+<div class="container py-5">
+  <h1 class="mb-2 text-center">SeaDoc Checker</h1>
+  <p class="text-center muted mb-4">Maritime document authenticity check (ELA-based) — multi-file, PDF & images.</p>
+
+  {% if error %}
+  <div class="alert alert-danger">{{ error }}</div>
+  {% endif %}
+
+  <div class="card p-4 mb-4">
+    <form method="POST" enctype="multipart/form-data">
+      <div class="dropzone mb-3">
+        <input class="form-control" type="file" name="files" id="files" multiple required />
+        <div class="small text-muted mt-2">Accepted: JPG, PNG, PDF • Max ~20 MB per request</div>
+      </div>
+      <button class="btn btn-primary w-100" type="submit">Analyze</button>
+    </form>
+  </div>
+
+  {% if results and results|length > 0 %}
+    <h3 class="mb-3">Results</h3>
+    <div class="row g-4">
+      {% for r in results %}
+      <div class="col-md-6">
+        <div class="card p-3 h-100">
+          <div class="d-flex justify-content-between align-items-center">
+            <div class="fw-semibold">{{ r.name }}</div>
+            {% if r.status == 'ok' %}
+              <span class="badge badge-ok">OK</span>
+            {% else %}
+              <span class="badge badge-err">ERR</span>
+            {% endif %}
+          </div>
+          {% if r.status == 'ok' %}
+          <div class="mt-3">
+            <div class="small muted mb-1">Overlay (suspected regions in red)</div>
+            <img class="img-fluid rounded" src="{{ url_for('static', filename=r.overlay_path) }}" alt="overlay">
+          </div>
+          <div class="mt-3">
+            <div class="small muted mb-1">ELA map</div>
+            <img class="img-fluid rounded" src="{{ url_for('static', filename=r.ela_path) }}" alt="ela">
+          </div>
+          <div class="mt-3 small-mono">{{ r.description }}</div>
+          {% else %}
+            <div class="mt-2 small-mono">{{ r.message }}</div>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <div class="mt-5 small muted">
+    <strong>Note:</strong> ELA is a heuristic. Treat results as a pre-screening signal, not a forensic verdict.
+  </div>
+</div>
+</body>
+</html>
