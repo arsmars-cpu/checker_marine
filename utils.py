@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import uuid
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import numpy as np
 import cv2
@@ -24,22 +24,25 @@ MAX_PDF_PAGES       = 5              # максимум страниц на ан
 SCORE_W_ELA         = 0.65
 SCORE_W_NOISE       = 0.35
 TEXT_SUPPRESS       = 0.5
-SCORE_PERCENTILE    = 95             # верхний перцентиль для маски
+SCORE_PERCENTILE    = 95             # дефолт (используем для базовой карты)
+UNION_PERCENTILE    = 94             # для объединённой карты (чуть ниже — чувствительнее)
 
-# Визуал: «кислотные» пятна + приглушённый фон
+# Визуал
+HEAT_COLORMAP       = cv2.COLORMAP_TURBO
+OVERLAY_ALPHA       = 0.65
+CONTOUR_THICK       = 2
+GLOW_THICK          = 8
+
+# ELA preview (для «ELA»-картинки)
 ELA_USE_CLAHE       = True
-ELA_VIS_GAIN        = 1.55           # усиливаем ELA
+ELA_VIS_GAIN        = 1.55
 ELA_VIS_GAMMA       = 0.82
-HEAT_COLORMAP       = cv2.COLORMAP_TURBO  # контрастная палитра
-OVERLAY_ALPHA       = 0.75           # плотность заливки
-CONTOUR_THICK       = 3              # контур зон
-GLOW_THICK          = 9              # «свечение» (внешний обвод)
 
 RESULTS_DIR = Path(__file__).parent / "static" / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ----------------- Низкоуровневые карты -----------------
+# ----------------- Базовые карты -----------------
 def local_variance(gray: np.ndarray, k: int = VAR_KERNEL) -> np.ndarray:
     gray_f = gray.astype(np.float32)
     mean = cv2.blur(gray_f, (k, k))
@@ -77,12 +80,11 @@ def text_mask(pil_img: Image.Image) -> np.ndarray:
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     txt = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    # фикс: сначала изображение, затем ядро
-    txt = cv2.dilate(txt, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+    txt = cv2.dilate(cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), 1, dst=txt)
     return txt  # 0..255
 
 
-# ----------------- Score и маска -----------------
+# ----------------- Базовый score -----------------
 def fused_score_from_maps(ela_u8: np.ndarray, gray_u8: np.ndarray) -> np.ndarray:
     """Score 0..1: 0 — нормально, 1 — сильная аномалия."""
     ela = ela_u8.astype(np.float32) / 255.0
@@ -93,7 +95,7 @@ def fused_score_from_maps(ela_u8: np.ndarray, gray_u8: np.ndarray) -> np.ndarray
     score = (score - score.min()) / (score.ptp() + 1e-6)
     return score.astype(np.float32)
 
-def suspicious_mask_from_score(score: np.ndarray, percentile: int = SCORE_PERCENTILE) -> np.ndarray:
+def suspicious_mask_from_score(score: np.ndarray, percentile: int) -> np.ndarray:
     thr = float(np.percentile(score, percentile))
     return (score >= thr).astype(np.uint8) * 255
 
@@ -115,7 +117,7 @@ def clean_and_filter_mask(mask: np.ndarray,
 
 # ----------------- Зоны -----------------
 def extract_regions(mask: np.ndarray, score_map: np.ndarray,
-                    max_regions: int = 6, pad: int = 8) -> List[Dict]:
+                    max_regions: int = 8, pad: int = 8) -> List[Dict]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     regs: List[Dict] = []
     H, W = mask.shape[:2]
@@ -130,13 +132,82 @@ def extract_regions(mask: np.ndarray, score_map: np.ndarray,
     return regs[:max_regions]
 
 
+# ----------------- НОВОЕ: 1) Erase detector -----------------
+def erase_flatness_map(pil_img: Image.Image, txt_mask_255: np.ndarray) -> np.ndarray:
+    """0..1, выше = подозрение на замазывание внутри текстовых поясов."""
+    g = np.array(pil_img.convert("L"))
+    lap = cv2.Laplacian(g, ddepth=cv2.CV_32F, ksize=3)
+    hf = np.abs(lap)
+    hf = (hf - hf.min()) / (hf.ptp() + 1e-6)
+
+    band = cv2.dilate(txt_mask_255, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 2).astype(bool)
+    flat = 1.0 - hf
+
+    out = np.zeros_like(flat, dtype=np.float32)
+    out[band] = flat[band]
+
+    # поджать хвост для «кислоты»
+    if np.any(out > 0):
+        qhi = float(np.quantile(out[out > 0], 0.98))
+        out = np.clip(out / (qhi + 1e-6), 0, 1)
+    return out.astype(np.float32)
+
+
+# ----------------- НОВОЕ: 2) Seam detector -----------------
+def seam_map(pil_img: Image.Image, ela_u8: np.ndarray) -> np.ndarray:
+    """0..1, выше = вероятный шов вставки (граница + ELA-пик)."""
+    g = np.array(pil_img.convert("L")).astype(np.float32)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.sqrt(gx * gx + gy * gy)
+    grad = (grad - grad.min()) / (grad.ptp() + 1e-6)
+
+    ela = ela_u8.astype(np.float32) / 255.0
+    s = grad * np.power(ela, 0.8)
+    s = (s - s.min()) / (s.ptp() + 1e-6)
+    s = cv2.GaussianBlur(s, (0, 0), 0.8)
+    return s.astype(np.float32)
+
+
+# ----------------- НОВОЕ: 3) Copy–Move detector -----------------
+def copy_move_regions(pil_img: Image.Image, min_matches: int = 12, bin_size: int = 8) -> Tuple[np.ndarray, List[Dict]]:
+    img = np.array(pil_img.convert("L"))
+    orb = cv2.ORB_create(nfeatures=4000)
+    kp, des = orb.detectAndCompute(img, None)
+    if des is None or kp is None or len(kp) < 2:
+        return np.zeros(img.shape, np.uint8), []
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    m = bf.match(des, des)
+    good = [x for x in m if x.queryIdx != x.trainIdx and x.distance < 35]
+
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for x in good:
+        p = np.array(kp[x.queryIdx].pt); q = np.array(kp[x.trainIdx].pt)
+        dx, dy = q - p
+        key = (int(dx // bin_size), int(dy // bin_size))
+        buckets[key].append((p, q))
+
+    mask = np.zeros(img.shape, np.uint8)
+    regs: List[Dict] = []
+    # Топ 5 кластеров
+    for _, pairs in sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]:
+        if len(pairs) < min_matches:
+            continue
+        pts = np.vstack([np.vstack([p for p, _ in pairs]), np.vstack([q for _, q in pairs])]).astype(np.int32)
+        x, y, w, h = cv2.boundingRect(pts)
+        cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
+        regs.append({"x": int(x), "y": int(y), "w": int(w), "h": int(h), "score": 1.0})
+    return mask, regs
+
+
 # ----------------- Визуализация -----------------
 def vivid_ela_visual(ela_gray_u8: np.ndarray,
                      use_clahe: bool = ELA_USE_CLAHE,
                      gain: float = ELA_VIS_GAIN,
                      gamma: float = ELA_VIS_GAMMA,
                      cmap: int = HEAT_COLORMAP) -> np.ndarray:
-    """Яркий контрастный ELA (BGR)."""
     x = ela_gray_u8.copy()
     if use_clahe:
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -146,54 +217,53 @@ def vivid_ela_visual(ela_gray_u8: np.ndarray,
     x = (f * 255.0 + 0.5).astype(np.uint8)
     return cv2.applyColorMap(x, cmap)
 
-def _desaturate_and_blur(bgr: np.ndarray) -> np.ndarray:
-    """Делаем фон «гладким»: лёгкая десатурация + блюр."""
+def _desat(bgr: np.ndarray, sat_scale: float = 0.5) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv[...,1] *= 0.25  # уменьшили насыщенность
+    hsv[..., 1] *= sat_scale
     hsv = np.clip(hsv, 0, 255).astype(np.uint8)
-    bgr_soft = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    bgr_soft = cv2.GaussianBlur(bgr_soft, (0, 0), sigmaX=2.0, sigmaY=2.0)
-    return bgr_soft
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-def acid_overlay(base_bgr: np.ndarray,
-                 score: np.ndarray,
-                 mask: np.ndarray,
-                 *,
-                 colormap: int = HEAT_COLORMAP,
-                 alpha: float = OVERLAY_ALPHA,
-                 contour_thick: int = CONTOUR_THICK,
-                 glow_thick: int = GLOW_THICK) -> np.ndarray:
+def compose_multi_overlay(base_bgr: np.ndarray,
+                          add_map: np.ndarray,      # базовый score_map 0..1
+                          erase_map: np.ndarray,    # 0..1
+                          seam_map_f: np.ndarray,   # 0..1
+                          cm_mask: np.ndarray | None,  # 0/255
+                          alpha: float = OVERLAY_ALPHA) -> np.ndarray:
     """
-    «Кислотные» зоны: фон приглушён, сами зоны в TURBO, с контуром и лёгким свечением.
+    Многослойный оверлей:
+      - add/replace: TURBO заливка
+      - erase: магента
+      - seam: оранжевый контур
+      - copy–move: лаймовые боксы
     """
-    H, W = mask.shape[:2]
-    # Фон
-    soft_bgr = _desaturate_and_blur(base_bgr)
-    out = soft_bgr.copy()
+    out = _desat(base_bgr, 0.45)
 
-    # Теплокарта из score
-    hm = (np.clip(score, 0, 1) * 255).astype(np.uint8)
-    hm_bgr = cv2.applyColorMap(hm, colormap)
+    # add/replace
+    hm = cv2.applyColorMap((np.clip(add_map, 0, 1) * 255).astype(np.uint8), HEAT_COLORMAP)
+    out = cv2.addWeighted(out, 1.0, hm, alpha, 0)
 
-    # Наложение только в маске
-    m3 = np.repeat((mask > 0)[:, :, None], 3, axis=2)
-    out[m3] = cv2.addWeighted(base_bgr[m3], 1.0 - alpha, hm_bgr[m3], alpha, 0)
+    # erase (magenta)
+    er = (np.clip(erase_map, 0, 1) * 255).astype(np.uint8)
+    if er.max() > 0:
+        mag = np.zeros_like(out); mag[..., 2] = 255; mag[..., 0] = 255  # BGR=(255,0,255)
+        m3 = er > 200
+        out[m3] = cv2.addWeighted(out[m3], 0.2, mag[m3], 0.8, 0)
 
-    # Свечение (внешний обвод)
-    if glow_thick > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (glow_thick, glow_thick))
-        glow = cv2.dilate(mask, kernel, iterations=1)
-        glow_edge = cv2.bitwise_and(glow, cv2.bitwise_not(mask))
-        glow_bgr = np.zeros_like(out)
-        glow_color = (0, 180, 255)  # яркая «бирюза»
-        glow_bgr[glow_edge > 0] = glow_color
-        out = cv2.addWeighted(out, 1.0, glow_bgr, 0.25, 0)
+    # seam (orange) тонкий контур
+    s = (np.clip(seam_map_f, 0, 1) * 255).astype(np.uint8)
+    _, sbin = cv2.threshold(s, 220, 255, cv2.THRESH_BINARY)
+    cnts, _ = cv2.findContours(sbin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(out, cnts, -1, (0, 140, 255), 2)
 
-    # Контур
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(out, contours, -1, (0, 0, 255), thickness=contour_thick)
+    # copy–move (lime) боксы
+    if cm_mask is not None and cm_mask.any():
+        cnts, _ = cv2.findContours(cm_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            x, y, w, h = cv2.boundingRect(c)
+            cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 180), 2)
 
     return out
+
 
 def draw_boxes(overlay_bgr: np.ndarray, regions: List[Dict]) -> np.ndarray:
     out = overlay_bgr.copy()
@@ -241,27 +311,39 @@ def iter_pdf_pages(pdf_path: Path, dpi: int = PDF_DPI, max_pages: int = MAX_PDF_
             yield i + 1, img
 
 
-# ----------------- Высокоуровневый пайплайн (один режим) -----------------
+# ----------------- Один режим (multi-cue) -----------------
 def process_pil_image(pil: Image.Image,
                       label: str,
                       batch: str,
                       *,
                       score_percentile: int = SCORE_PERCENTILE) -> Dict:
     """
-    Один фиксированный режим:
-      ELA⊕Noise -> верхний перцентиль -> «кислотный» overlay + боксы + кропы.
+    Один фикс. режим:
+      базовый add/replace (ELA⊕Noise) + erase + seam + copy–move → объединение → многослойный «кислотный» оверлей.
     """
-    # Карты
+    # Базовые карты
     ela_u8 = ela_map(pil)                    # 0..255
     gray_u8 = np.array(pil.convert("L"))     # 0..255
-    score = fused_score_from_maps(ela_u8, gray_u8)  # 0..1
+    score_base = fused_score_from_maps(ela_u8, gray_u8)  # 0..1
+    txt255 = text_mask(pil)                  # 0/255
 
-    # Маска и зоны
-    mask = suspicious_mask_from_score(score, percentile=score_percentile)
-    mask = clean_and_filter_mask(mask, min_area_ratio=MIN_AREA_RATIO, morph=MASK_MORPH)
-    regions = extract_regions(mask, score, max_regions=6, pad=8)
+    # Новые детекторы
+    erase = erase_flatness_map(pil, txt255)          # 0..1
+    seam  = seam_map(pil, ela_u8)                    # 0..1
+    cm_mask, cm_regs = copy_move_regions(pil)        # 0/255 и регионы
 
-    # Изображения
+    # Объединённая карта (чуть сильнее чувствительность)
+    score_union = np.maximum.reduce([
+        score_base,
+        0.7 * erase,
+        0.8 * seam,
+        0.9 * ((cm_mask > 0).astype(np.float32))
+    ])
+    mask_union  = suspicious_mask_from_score(score_union, percentile=UNION_PERCENTILE)
+    mask_union  = clean_and_filter_mask(mask_union, MIN_AREA_RATIO, MASK_MORPH)
+    regions_union = extract_regions(mask_union, score_union, max_regions=8, pad=8)
+
+    # Визуалы
     src_rgb = np.array(pil.convert("RGB"))
     src_bgr = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2BGR)
 
@@ -269,13 +351,11 @@ def process_pil_image(pil: Image.Image,
                                    gain=ELA_VIS_GAIN, gamma=ELA_VIS_GAMMA,
                                    cmap=HEAT_COLORMAP)
 
-    overlay_bgr = acid_overlay(src_bgr, score, mask,
-                               colormap=HEAT_COLORMAP,
-                               alpha=OVERLAY_ALPHA,
-                               contour_thick=CONTOUR_THICK,
-                               glow_thick=GLOW_THICK)
-
-    boxed_bgr = draw_boxes(overlay_bgr, regions)
+    overlay_bgr = compose_multi_overlay(
+        src_bgr, add_map=score_base,
+        erase_map=erase, seam_map_f=seam, cm_mask=cm_mask, alpha=OVERLAY_ALPHA
+    )
+    boxed_bgr = draw_boxes(overlay_bgr, regions_union)
 
     # Файлы
     stem = f"{batch}_{uuid.uuid4().hex[:6]}"
@@ -289,10 +369,9 @@ def process_pil_image(pil: Image.Image,
     Image.fromarray(cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)).save(str(RESULTS_DIR / ovl_name), "JPEG", quality=95)
     Image.fromarray(cv2.cvtColor(boxed_bgr,  cv2.COLOR_BGR2RGB)).save(str(RESULTS_DIR / boxed_name), "JPEG", quality=95)
 
-    crops_meta = save_crops(src_rgb, regions, stem, RESULTS_DIR)
+    crops_meta = save_crops(src_rgb, regions_union, stem, RESULTS_DIR)
 
-    # Лаконичный вывод
-    verdict = "Review recommended" if regions else "No issues found"
+    verdict = "Review recommended" if regions_union else "No issues found"
 
     return {
         "label": label,
@@ -301,7 +380,7 @@ def process_pil_image(pil: Image.Image,
         "overlay":  f"/static/results/{ovl_name}",
         "boxed":    f"/static/results/{boxed_name}",
         "verdict":  verdict,
-        "regions":  len(regions),
+        "regions":  len(regions_union),
         "crops":    crops_meta,
-        "summary":  "Top regions highlighted." if regions else "No anomalies detected."
+        "summary":  "Add/Replace (turbo), Erase (magenta), Seam (orange), Copy–Move (lime)."
     }
