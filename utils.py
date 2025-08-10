@@ -80,7 +80,8 @@ def text_mask(pil_img: Image.Image) -> np.ndarray:
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     txt = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    txt = cv2.dilate(cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), 1, dst=txt)
+    # FIX: порядок аргументов у cv2.dilate (src, kernel, iterations)
+    txt = cv2.dilate(txt, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
     return txt  # 0..255
 
 
@@ -146,7 +147,6 @@ def erase_flatness_map(pil_img: Image.Image, txt_mask_255: np.ndarray) -> np.nda
     out = np.zeros_like(flat, dtype=np.float32)
     out[band] = flat[band]
 
-    # поджать хвост для «кислоты»
     if np.any(out > 0):
         qhi = float(np.quantile(out[out > 0], 0.98))
         out = np.clip(out / (qhi + 1e-6), 0, 1)
@@ -172,7 +172,11 @@ def seam_map(pil_img: Image.Image, ela_u8: np.ndarray) -> np.ndarray:
 # ----------------- НОВОЕ: 3) Copy–Move detector -----------------
 def copy_move_regions(pil_img: Image.Image, min_matches: int = 12, bin_size: int = 8) -> Tuple[np.ndarray, List[Dict]]:
     img = np.array(pil_img.convert("L"))
-    orb = cv2.ORB_create(nfeatures=4000)
+    try:
+        orb = cv2.ORB_create(nfeatures=4000)
+    except Exception:
+        # на некоторых билдах OpenCV бывает ORB отсутствует
+        return np.zeros(img.shape, np.uint8), []
     kp, des = orb.detectAndCompute(img, None)
     if des is None or kp is None or len(kp) < 2:
         return np.zeros(img.shape, np.uint8), []
@@ -191,7 +195,6 @@ def copy_move_regions(pil_img: Image.Image, min_matches: int = 12, bin_size: int
 
     mask = np.zeros(img.shape, np.uint8)
     regs: List[Dict] = []
-    # Топ 5 кластеров
     for _, pairs in sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]:
         if len(pairs) < min_matches:
             continue
