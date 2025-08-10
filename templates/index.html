@@ -32,10 +32,14 @@
     .btn{background:var(--accent); border:none; color:white; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:600}
     .btn:disabled{opacity:.6; cursor:not-allowed}
     input[type=file]{padding:8px; border-radius:10px; background:var(--bg); border:1px dashed #334155; color:var(--ink)}
+    input[type=range]{width:100%}
     details{background:#0c1426; border:1px solid #1e293b; border-radius:10px; padding:10px; margin-top:10px}
     summary{cursor:pointer; color:#cbd5e1}
     pre{white-space:pre-wrap; word-break:break-word; margin:8px 0 0 0}
     .row{display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center}
+    .controls{display:grid; grid-template-columns:repeat(3,1fr); gap:14px}
+    .hidden{display:none}
+    @media (max-width:920px){.controls{grid-template-columns:1fr}}
     @media (max-width:720px){.row{grid-template-columns:1fr}}
   </style>
 </head>
@@ -48,6 +52,25 @@
       <div class="row">
         <input id="fileInput" type="file" name="file" multiple required accept=".jpg,.jpeg,.png,.pdf">
         <button class="btn" type="submit">Upload & Analyze</button>
+      </div>
+
+      <!-- Controls: ELA/Overlay/Sensitivity -->
+      <div class="controls" style="margin-top:12px">
+        <label>
+          <div class="label">ELA intensity</div>
+          <input type="range" name="ela_gain" id="elaGain" min="1.0" max="1.8" step="0.05" value="1.4">
+          <div class="sub"><span id="elaGainVal">1.4</span></div>
+        </label>
+        <label>
+          <div class="label">Overlay opacity</div>
+          <input type="range" name="overlay_alpha" id="ovAlpha" min="0.2" max="0.8" step="0.05" value="0.5">
+          <div class="sub"><span id="ovAlphaVal">0.5</span></div>
+        </label>
+        <label>
+          <div class="label">Sensitivity (percentile)</div>
+          <input type="range" name="score_percentile" id="percentile" min="88" max="98" step="1" value="95">
+          <div class="sub"><span id="percentileVal">95%</span></div>
+        </label>
       </div>
     </form>
     {% if message %}
@@ -62,7 +85,17 @@
         <div class="label">{{ r.label }}</div>
 
         {% if r.original %}
-          <div class="imgbox"><img src="{{ r.original }}" alt="Original"></div>
+          <!-- toggle button -->
+          {% if r.boxed or r.overlay %}
+            <div class="row" style="grid-template-columns:auto auto;gap:8px;margin-bottom:8px">
+              <button class="btn" type="button"
+                onclick="const card=this.closest('.panel'); card.querySelectorAll('.view-original,.view-boxed').forEach(el=>el.classList.toggle('hidden'));">
+                Toggle: Original ↔ Boxed
+              </button>
+            </div>
+          {% endif %}
+
+          <div class="imgbox view-original"><img src="{{ r.original }}" alt="Original"></div>
         {% endif %}
 
         {% if r.ela %}
@@ -70,9 +103,9 @@
         {% endif %}
 
         {% if r.boxed %}
-          <div class="imgbox" style="margin-top:8px"><img src="{{ r.boxed }}" alt="Overlay with boxes"></div>
+          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img src="{{ r.boxed }}" alt="Overlay with boxes"></div>
         {% elif r.overlay %}
-          <div class="imgbox" style="margin-top:8px"><img src="{{ r.overlay }}" alt="Overlay"></div>
+          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img src="{{ r.overlay }}" alt="Overlay"></div>
         {% endif %}
 
         {% if r.crops and r.crops|length > 0 %}
@@ -119,6 +152,22 @@
   </div>
 
   <script>
+    // обновление значений ползунков
+    const gain = document.getElementById('elaGain');
+    const gainVal = document.getElementById('elaGainVal');
+    const alpha = document.getElementById('ovAlpha');
+    const alphaVal = document.getElementById('ovAlphaVal');
+    const perc = document.getElementById('percentile');
+    const percVal = document.getElementById('percentileVal');
+
+    function upd() {
+      if (gain && gainVal) gainVal.textContent = Number(gain.value).toFixed(2);
+      if (alpha && alphaVal) alphaVal.textContent = Number(alpha.value).toFixed(2);
+      if (perc && percVal) percVal.textContent = perc.value + '%';
+    }
+    [gain, alpha, perc].forEach(el => el && el.addEventListener('input', upd));
+    upd();
+
     // фронтовая проверка размера (серверный лимит 25MB)
     document.getElementById('uploadForm').addEventListener('submit', function (e) {
       const files = document.getElementById('fileInput').files;
