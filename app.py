@@ -1,104 +1,300 @@
 import os
+import io
 import uuid
 from pathlib import Path
+
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
-from PIL import Image
-import fitz  # PyMuPDF
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter
 import numpy as np
+import cv2
+import fitz  # PyMuPDF
 
-from error_level_analysis import ela_image
+# ----------------- Конфиг -----------------
+BASE_DIR = Path(__file__).parent
+UPLOAD_DIR = BASE_DIR / "static" / "uploads"
+RESULTS_DIR = BASE_DIR / "static" / "results"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-UPLOAD_DIR = Path("static/uploads")
-RESULTS_DIR = Path("static/results")
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".pdf"}
+
+# Порог/параметры (подкручиваемые)
+JPEG_QUALITIES = (90, 95, 98)     # ансамблевый ELA
+VAR_KERNEL = 9                    # окно для локальной дисперсии
+MIN_AREA_RATIO = 0.002            # минимальная площадь пятна (0.2% от страницы)
+MASK_MORPH = 3                    # морфология для очистки маски
+PDF_DPI = 300                     # рендер PDF (выше — точнее, но дольше)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
+
+# ----------------- Утилиты -----------------
 def allowed_file(name: str) -> bool:
     return Path(name).suffix.lower() in ALLOWED_EXT
 
-def save_pil(pil, path, quality=95):
+
+def save_img(pil: Image.Image, path: Path, quality=95):
     path.parent.mkdir(parents=True, exist_ok=True)
-    pil.save(str(path), quality=quality)
+    pil.convert("RGB").save(str(path), "JPEG", quality=quality)
 
-def pdf_to_images(pdf_path: Path):
-    doc = fitz.open(str(pdf_path))
-    for page_index in range(len(doc)):
-        page = doc.load_page(page_index)
-        pix = page.get_pixmap(dpi=200, alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        yield img, page_index
 
-def describe_artifacts(ela_pil):
-    arr = np.asarray(ela_pil.convert("L"))
-    mean = float(arr.mean())
-    strong = (arr > 220).sum()
-    total = arr.size
-    pct = 100.0 * strong / max(1,total)
-    hints = []
-    if pct > 0.6:
-        hints.append("large bright regions")
-    elif pct > 0.25:
-        hints.append("moderate highlight regions")
-    if mean > 25:
-        hints.append("overall elevated error level")
-    if not hints:
-        return "No obvious manipulated zones; ELA looks consistent."
-    return "ELA highlights " + ", ".join(hints) + "."
+def to_gray(np_img: np.ndarray) -> np.ndarray:
+    if np_img.ndim == 2:
+        return np_img
+    return cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
 
+
+def local_variance(gray: np.ndarray, k: int = 9) -> np.ndarray:
+    # дисперсия по окну k×k
+    gray_f = gray.astype(np.float32)
+    mean = cv2.blur(gray_f, (k, k))
+    sqmean = cv2.blur(gray_f * gray_f, (k, k))
+    var = np.clip(sqmean - mean * mean, 0, None)
+    return var
+
+
+def ela_map(pil_img: Image.Image) -> np.ndarray:
+    """
+    Ансамблевый ELA: строим карты для нескольких JPEG-качеств и берём покомпонентный максимум.
+    Возвращает ELA-грей ndarray (0..255).
+    """
+    pil_rgb = pil_img.convert("RGB")
+    maps = []
+    for q in JPEG_QUALITIES:
+        buf = io.BytesIO()
+        pil_rgb.save(buf, "JPEG", quality=q)
+        buf.seek(0)
+        resaved = Image.open(buf).convert("RGB")
+        diff = ImageChops.difference(pil_rgb, resaved)
+
+        # автоусиление
+        extrema = diff.getextrema()
+        max_diff = max(e[1] for e in extrema) or 1
+        scale = 255.0 / max_diff
+        diff = ImageEnhance.Brightness(diff).enhance(scale)
+        maps.append(np.array(diff.convert("L")))
+
+    ela = np.maximum.reduce(maps)  # покомпонентный максимум
+    return ela
+
+
+def suspicious_mask_from_background(ela_gray: np.ndarray) -> np.ndarray:
+    """
+    Выделяем именно однородные/плоские пятна фона.
+    1) Строим карту локальной дисперсии (на исходном ELA).
+    2) Адаптивный порог: берём клетки с низкой вариативностью.
+    3) Чистим морфологией + фильтруем по площади.
+    """
+    # нормализуем слегка
+    ela_norm = cv2.GaussianBlur(ela_gray, (3, 3), 0)
+
+    # локальная дисперсия — «пластилиновые» патчи будут с низкой дисперсией
+    var = local_variance(ela_norm, VAR_KERNEL)
+    var = cv2.normalize(var, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # инвертируем: низкая вариативность -> высокая маска
+    inv = cv2.bitwise_not(var)
+
+    # порог адаптивный по статистике кадра
+    med = np.median(inv)
+    q1, q3 = np.percentile(inv, [25, 75])
+    iqr = max(1.0, q3 - q1)
+    thr = int(min(255, med + 1.25 * iqr))  # можно подкрутить 1.25..1.75
+    _, mask = cv2.threshold(inv, thr, 255, cv2.THRESH_BINARY)
+
+    # морф. очистка
+    kernel = np.ones((MASK_MORPH, MASK_MORPH), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # фильтр по минимальной площади
+    h, w = mask.shape[:2]
+    min_area = int(MIN_AREA_RATIO * w * h)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(mask)
+    for c in contours:
+        if cv2.contourArea(c) >= min_area:
+            cv2.drawContours(out, [c], -1, 255, thickness=-1)
+    return out
+
+
+def summarize_mask(mask: np.ndarray) -> tuple[float, int]:
+    total = mask.size
+    pos = int((mask > 0).sum())
+    pct = 100.0 * pos / max(1, total)
+    # посчитаем отдельные пятна
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return pct, len(contours)
+
+
+def verdict_from_percent(p: float) -> str:
+    if p >= 10.0:
+        return "High (likely edited)"
+    if p >= 3.0:
+        return "Medium (possible edits)"
+    return "Low (no clear edits)"
+
+
+def overlay_suspicious(base_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Рисуем полупрозрачную синюю заливку по подозрительным зонам + контур.
+    """
+    overlay = base_rgb.copy()
+    color = (0, 140, 255)  # BGR (оранжево-синий оттенок)
+    alpha = 0.35
+
+    # контуры
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # полупрозрачная заливка
+    fill = np.zeros_like(overlay)
+    cv2.drawContours(fill, contours, -1, color, thickness=-1)
+    overlay = cv2.addWeighted(overlay, 1.0, fill, alpha, 0)
+
+    # обводка
+    cv2.drawContours(overlay, contours, -1, (0, 0, 255), thickness=2)
+    return overlay
+
+
+def render_pdf_to_images(pdf_path: Path, dpi: int = PDF_DPI) -> list[Image.Image]:
+    pages = []
+    with fitz.open(str(pdf_path)) as doc:
+        for i in range(len(doc)):
+            pix = doc[i].get_pixmap(dpi=dpi, alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            pages.append(img)
+    return pages
+
+
+def process_pil_image(pil: Image.Image, label: str, batch: str) -> dict:
+    """
+    Основной конвейер:
+      PIL -> ELA (ансамбль) -> маска ровных пятен -> проценты -> verdict -> картинки
+    """
+    # 1) ELA
+    ela = ela_map(pil)
+
+    # 2) подозрительная маска (только по фону)
+    mask = suspicious_mask_from_background(ela)
+
+    # 3) проценты + аномалии
+    pct, regions = summarize_mask(mask)
+    verdict = verdict_from_percent(pct)
+
+    # 4) готовим картинки для UI
+    src = np.array(pil.convert("RGB"))
+    ela_vis = cv2.applyColorMap(ela.astype(np.uint8), cv2.COLORMAP_INFERNO)
+    overlay = overlay_suspicious(src, mask)
+
+    # 5) сохраняем
+    stem = f"{batch}_{uuid.uuid4().hex[:6]}"
+
+    src_path = RESULTS_DIR / f"{stem}_src.jpg"
+    ela_path = RESULTS_DIR / f"{stem}_ela.jpg"
+    ovl_path = RESULTS_DIR / f"{stem}_overlay.jpg"
+
+    Image.fromarray(src).save(str(src_path), "JPEG", quality=95)
+    Image.fromarray(cv2.cvtColor(ela_vis, cv2.COLOR_BGR2RGB)).save(str(ela_path), "JPEG", quality=95)
+    Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)).save(str(ovl_path), "JPEG", quality=95)
+
+    summary = {
+        "label": label,
+        "suspicious_percent": round(pct, 2),
+        "regions": regions,
+        "verdict": verdict
+    }
+    return {
+        "summary": summary,
+        "original": str(src_path).replace("\\", "/"),
+        "ela": str(ela_path).replace("\\", "/"),
+        "overlay": str(ovl_path).replace("\\", "/")
+    }
+
+
+# ----------------- Роуты -----------------
 @app.route("/", methods=["GET"])
 def index():
     return render_template("index.html", results=[])
+
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
     files = request.files.getlist("file")
     if not files:
         return render_template("index.html", results=[], message="No files uploaded.")
-    batch_id = uuid.uuid4().hex[:8]
+
+    batch = uuid.uuid4().hex[:8]
     results = []
+
     for f in files:
-        if f and allowed_file(f.filename):
-            fname = secure_filename(f.filename)
-            ext = Path(fname).suffix.lower()
-            base = Path(fname).stem
-            upload_path = UPLOAD_DIR / f"{batch_id}_{fname}"
-            upload_path.parent.mkdir(parents=True, exist_ok=True)
-            f.save(str(upload_path))
+        if not f or not allowed_file(f.filename):
+            continue
+        fname = secure_filename(f.filename)
+        ext = Path(fname).suffix.lower()
+        upath = UPLOAD_DIR / f"{batch}_{fname}"
+        upath.parent.mkdir(parents=True, exist_ok=True)
+        f.save(str(upath))
 
+        try:
             if ext == ".pdf":
-                for pil_img, page_index in pdf_to_images(upload_path):
-                    ela = ela_image(pil_img)
-                    out_name = f"{batch_id}_{base}_p{page_index+1}_ela.jpg"
-                    out_path = RESULTS_DIR / out_name
-                    save_pil(ela, out_path, quality=95)
-                    page_name = f"{batch_id}_{base}_p{page_index+1}.jpg"
-                    page_path = RESULTS_DIR / page_name
-                    save_pil(pil_img, page_path, quality=90)
-                    results.append({
-                        "original": str(page_path).replace("\\","/"),
-                        "ela": str(out_path).replace("\\","/"),
-                        "summary": describe_artifacts(ela),
-                        "label": f"{fname} — page {page_index+1}"
-                    })
+                pages = render_pdf_to_images(upath, dpi=PDF_DPI)
+                for i, pimg in enumerate(pages, start=1):
+                    res = process_pil_image(pimg, f"{fname} — page {i}", batch)
+                    results.append(res)
             else:
-                pil = Image.open(str(upload_path))
-                ela = ela_image(pil)
-                out_name = f"{batch_id}_{base}_ela.jpg"
-                out_path = RESULTS_DIR / out_name
-                save_pil(ela, out_path, quality=95)
-                results.append({
-                    "original": str(upload_path).replace("\\","/"),
-                    "ela": str(out_path).replace("\\","/"),
-                    "summary": describe_artifacts(ela),
-                    "label": fname
-                })
-    return render_template("index.html", results=results, message=f"Processed {len(results)} page(s)/file(s). Batch {batch_id}.")
+                pil = Image.open(str(upath)).convert("RGB")
+                res = process_pil_image(pil, fname, batch)
+                results.append(res)
+        except Exception as e:
+            results.append({
+                "summary": {"label": fname, "verdict": "Error", "suspicious_percent": 0.0, "regions": 0},
+                "original": str(upath).replace("\\","/"),
+                "ela": "",
+                "overlay": "",
+                "error": str(e)
+            })
 
-@app.route('/health')
+    return render_template("index.html", results=results, message=f"Batch {batch}: processed {len(results)} item(s).")
+
+
+# API для бота/интеграций
+@app.post("/api/analyze")
+def api_analyze():
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"ok": False, "error": "no files"}), 400
+
+    batch = uuid.uuid4().hex[:8]
+    out = []
+    for f in files:
+        if not f or not allowed_file(f.filename):
+            continue
+        fname = secure_filename(f.filename)
+        ext = Path(fname).suffix.lower()
+
+        # читаем в память и в PIL
+        if ext == ".pdf":
+            tmp = io.BytesIO(f.read())
+            tmp.seek(0)
+            doc = fitz.open(stream=tmp.read(), filetype="pdf")
+            for i, page in enumerate(doc, start=1):
+                pix = page.get_pixmap(dpi=PDF_DPI, alpha=False)
+                pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                res = process_pil_image(pil, f"{fname} — page {i}", batch)
+                out.append(res)
+        else:
+            pil = Image.open(f.stream).convert("RGB")
+            res = process_pil_image(pil, fname, batch)
+            out.append(res)
+
+    return jsonify({"ok": True, "batch": batch, "results": out})
+
+
+@app.get("/health")
 def health():
-    return jsonify({"status":"ok"})
+    return "ok", 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
