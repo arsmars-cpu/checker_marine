@@ -29,6 +29,17 @@ MIN_AREA_RATIO = 0.002            # минимальная площадь пят
 MASK_MORPH = 3                    # морфология для очистки маски (тоньше)
 PDF_DPI = 200                     # рендер PDF (понизили, чтобы не падала память)
 MAX_PDF_PAGES = 5                 # анализируем максимум N страниц из PDF
+SCORE_PERCENTILE = 95             # перцентиль порога по score
+
+# Усиление визуала ELA
+ELA_GAIN = 1.4        # 1.2–1.8
+ELA_GAMMA = 0.85      # 0.75–0.9 (меньше -> светлее)
+ELA_USE_CLAHE = True
+ELA_COLORMAP = cv2.COLORMAP_TURBO  # контрастнее и читаемее
+
+# Видимость подозрительных зон на overlay
+OVERLAY_ALPHA = 0.50
+OVERLAY_CONTOUR_THICK = 3
 
 # ----------------- Утилиты -----------------
 def allowed_file(name: str) -> bool:
@@ -96,7 +107,7 @@ def suspicious_mask_from_background(ela_gray: np.ndarray, pil_for_text: Image.Im
     Комбинированный скоринг:
       1) score = 0.65*ELA_norm + 0.35*noise_map
       2) приглушаем печатный текст
-      3) берём верхний перцентиль (95-й) -> бинарная маска
+      3) берём верхний перцентиль -> бинарная маска
       4) морфология + отсев по площади
     """
     # ELA -> [0..1]
@@ -115,9 +126,9 @@ def suspicious_mask_from_background(ela_gray: np.ndarray, pil_for_text: Image.Im
     tmask = text_mask(pil_for_text)  # 0/255
     score = score * (1.0 - 0.5 * (tmask.astype(np.float32) / 255.0))
 
-    # адаптивный порог по перцентилю
-    p95 = float(np.percentile(score, 95))
-    mask = (score >= p95).astype(np.uint8) * 255
+    # адаптивный порог по перцентилю (вынесен в конфиг)
+    thr = float(np.percentile(score, SCORE_PERCENTILE))
+    mask = (score >= thr).astype(np.uint8) * 255
 
     # морфология
     kernel = np.ones((MASK_MORPH, MASK_MORPH), np.uint8)
@@ -150,18 +161,16 @@ def overlay_suspicious(base_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     base_bgr — изображение в цветовом пространстве BGR.
     """
     overlay = base_bgr.copy()
-    color = (0, 140, 255)  # BGR
-    alpha = 0.35
-
+    fill_color = (0, 140, 255)  # BGR
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     # заливка
     fill = np.zeros_like(overlay)
-    cv2.drawContours(fill, contours, -1, color, thickness=-1)
-    overlay = cv2.addWeighted(overlay, 1.0, fill, alpha, 0)
+    cv2.drawContours(fill, contours, -1, fill_color, thickness=-1)
+    overlay = cv2.addWeighted(overlay, 1.0, fill, OVERLAY_ALPHA, 0)
 
-    # обводка
-    cv2.drawContours(overlay, contours, -1, (0, 0, 255), thickness=2)
+    # обводка — толще, чтобы было видно
+    cv2.drawContours(overlay, contours, -1, (0, 0, 255), thickness=OVERLAY_CONTOUR_THICK)
     return overlay
 
 def extract_regions(mask: np.ndarray, score_map: np.ndarray, max_regions: int = 6, pad: int = 8):
@@ -222,7 +231,17 @@ def process_pil_image(pil: Image.Image, label: str, batch: str) -> dict:
     # 4) готовим картинки
     src_rgb = np.array(pil.convert("RGB"))
     src_bgr = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2BGR)
-    ela_vis_bgr = cv2.applyColorMap(ela.astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+    # --- ЯРКИЙ и КОНТРАСТНЫЙ ELA-виз ---
+    ela_u8 = ela.astype(np.uint8)
+    if ELA_USE_CLAHE:
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        ela_u8 = clahe.apply(ela_u8)
+    ela_f = np.clip((ela_u8.astype(np.float32) / 255.0) * ELA_GAIN, 0, 1)
+    ela_f = np.power(ela_f, ELA_GAMMA)
+    ela_u8 = (ela_f * 255.0 + 0.5).astype(np.uint8)
+    ela_vis_bgr = cv2.applyColorMap(ela_u8, ELA_COLORMAP)
+
     overlay_bgr = overlay_suspicious(src_bgr, mask)
 
     # overlay + рамки + индексы
