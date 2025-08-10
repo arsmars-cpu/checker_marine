@@ -5,40 +5,90 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>SeaDoc Checker — Document Forensics</title>
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif; margin:24px; background:#0b1220; color:#e6edf3;}
-    h1{margin:0 0 8px 0;}
-    .sub{opacity:.8; margin-bottom:16px;}
-    .card{background:#111827; border:1px solid #1f2937; border-radius:12px; padding:16px; margin:12px 0;}
-    .grid{display:grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap:12px;}
-    .imgbox{background:#0d1322; border:1px solid #243045; border-radius:10px; padding:8px;}
-    img{max-width:100%; border-radius:8px; display:block;}
-    .label{font-size:12px; opacity:.85; margin:6px 0 2px;}
-    .summary{font-size:13px; color:#a7f3d0; margin-top:6px;}
-    .footer{opacity:.7; font-size:12px; margin-top:24px;}
-    .btn{background:#2563eb; border:none; color:white; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:600;}
-    .btn:disabled{opacity:.6; cursor:not-allowed;}
-    input[type=file]{padding:8px; border-radius:8px; background:#0b1220; border:1px dashed #334155; color:#e6edf3;}
+    :root{
+      --bg:#0b1220;--panel:#111827;--line:#1f2937;--ink:#e6edf3;--muted:#94a3b8;
+      --chip:#0d1322;--chipLine:#243045;--accent:#2563eb;--good:#34d399;--warn:#f59e0b;--bad:#ef4444;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;
+      margin:24px; background:var(--bg); color:var(--ink);
+    }
+    h1{margin:0 0 8px 0}
+    .sub{opacity:.85; margin-bottom:16px; color:var(--muted)}
+    .panel{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; margin:12px 0}
+    .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:14px}
+    .imgbox{background:var(--chip); border:1px solid var(--chipLine); border-radius:10px; padding:8px}
+    img{max-width:100%; border-radius:8px; display:block}
+    .label{font-size:12px; opacity:.9; margin:6px 0 8px}
+    .summary{font-size:13px; margin-top:8px}
+    .summary strong{color:#cbd5e1}
+    .verdict-low{color:var(--good)}
+    .verdict-med{color:var(--warn)}
+    .verdict-high{color:var(--bad)}
+    .footer{opacity:.7; font-size:12px; margin-top:22px; color:var(--muted)}
+    .btn{background:var(--accent); border:none; color:white; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:600}
+    .btn:disabled{opacity:.6; cursor:not-allowed}
+    input[type=file]{padding:8px; border-radius:10px; background:var(--bg); border:1px dashed #334155; color:var(--ink)}
+    details{background:#0c1426; border:1px solid #1e293b; border-radius:10px; padding:10px; margin-top:10px}
+    summary{cursor:pointer; color:#cbd5e1}
+    pre{white-space:pre-wrap; word-break:break-word; margin:8px 0 0 0}
+    .row{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+    @media (max-width:720px){.row{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
   <h1>SeaDoc Checker</h1>
   <div class="sub">Upload maritime documents (JPG/PNG/PDF). We'll run ELA and highlight potential manipulation zones.</div>
-  <div class="card">
+
+  <div class="panel">
     <form action="/analyze" method="post" enctype="multipart/form-data">
-      <input type="file" name="file" multiple required>
-      <button class="btn" type="submit">Upload & Analyze</button>
+      <div class="row">
+        <input type="file" name="file" multiple required>
+        <button class="btn" type="submit">Upload & Analyze</button>
+      </div>
     </form>
-    {% if message %}<div class="sub" style="margin-top:8px">{{ message }}</div>{% endif %}
+    {% if message %}
+      <div class="sub" style="margin-top:8px">{{ message }}</div>
+    {% endif %}
   </div>
 
   {% if results %}
   <div class="grid">
     {% for r in results %}
-      <div class="card">
+      <div class="panel">
         <div class="label">{{ r.label }}</div>
+
         <div class="imgbox"><img src="{{ r.original }}" alt="original"></div>
-        <div class="imgbox" style="margin-top:8px"><img src="{{ r.ela }}" alt="ela"></div>
-        <div class="summary">🔎 {{ r.summary }}</div>
+
+        {% if r.ela %}
+          <div class="imgbox" style="margin-top:8px"><img src="{{ r.ela }}" alt="ELA preview"></div>
+        {% endif %}
+
+        {% if r.mask %}
+          <div class="imgbox" style="margin-top:8px"><img src="{{ r.mask }}" alt="Regions mask"></div>
+        {% endif %}
+
+        <div class="summary">
+          {% set v = (r.verdict or 'Low')|string|lower %}
+          <div>
+            <strong>Verdict:</strong>
+            <span class="verdict-{% if 'high' in v %}high{% elif 'med' in v %}med{% else %}low{% endif %}">
+              {{ r.verdict or 'Low (no clear edits)' }}
+            </span>
+          </div>
+          <div><strong>Suspicious:</strong> {{ (r.suspicious_percent or 0)|round(1) }}%</div>
+          <div><strong>Regions:</strong> {{ (r.regions or [])|length }}</div>
+          {% if r.summary %}
+            <div style="margin-top:6px">🔎 {{ r.summary }}</div>
+          {% endif %}
+        </div>
+
+        <details>
+          <summary>Raw</summary>
+          <pre>{{ r | tojson(indent=2) }}</pre>
+        </details>
       </div>
     {% endfor %}
   </div>
