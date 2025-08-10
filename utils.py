@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import uuid
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict
 
 import numpy as np
 import cv2
@@ -77,7 +77,8 @@ def text_mask(pil_img: Image.Image) -> np.ndarray:
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     txt = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    txt = cv2.dilate(cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), 1, dst=txt)
+    # фикс: сначала изображение, затем ядро
+    txt = cv2.dilate(txt, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
     return txt  # 0..255
 
 
@@ -290,7 +291,7 @@ def process_pil_image(pil: Image.Image,
 
     crops_meta = save_crops(src_rgb, regions, stem, RESULTS_DIR)
 
-    # Лаконичный вывод (только светофор в приложении формируешь уже в app.py)
+    # Лаконичный вывод
     verdict = "Review recommended" if regions else "No issues found"
 
     return {
