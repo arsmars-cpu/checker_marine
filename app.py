@@ -69,7 +69,7 @@ def allowed_file(name: str) -> bool:
     return bool(name) and Path(name).suffix.lower() in ALLOWED_EXT
 
 def cleanup_results_dir(max_age_hours: int = MAX_RESULT_AGE_HOURS):
-    """Удаляем старые JPG/PDF из результатов: простая гигиена и приватность."""
+    """Удаляем старые JPG/PDF из результатов: гигиена и приватность."""
     cutoff = time.time() - max_age_hours * 3600
     removed = 0
     for p in RESULTS_DIR.glob("*"):
@@ -108,7 +108,7 @@ def noise_map_from_gray(gray_u8: np.ndarray, k: int = 9) -> np.ndarray:
     return 1.0 - var
 
 def ela_map(pil_img: Image.Image) -> np.ndarray:
-    """Ансамблевый ELA: максимум по нескольким JPEG-качествам, с автоусилением."""
+    """Ансамблевый ELA: максимум по нескольким JPEG-качествам, с автоусилением (0..255)."""
     pil_rgb = pil_img.convert("RGB")
     maps = []
     for q in JPEG_QUALITIES:
@@ -189,7 +189,6 @@ def classify_severity(regions, score_map) -> tuple[str, str]:
     return "yellow", "Suspicious"
 
 def _severity_color_rgb(sev: str):
-    # RGB 0..1 для заголовка/легенды в PDF
     if sev == "red":
         return (1, 0.27, 0.27)
     if sev == "yellow":
@@ -224,7 +223,7 @@ def create_report_pdf(stem: str, label: str, severity: str, verdict_text: str, p
     y += 18
 
     # Легенда светофора
-    chip_w, chip_h, gap = 16, 10, 12
+    chip_w, chip_h = 16, 10
     legend_x = LM
     legends = [("Green — OK", (0.2, 0.85, 0.55)),
                ("Yellow — Suspicious", (1, 0.75, 0.2)),
@@ -266,27 +265,29 @@ def process_pil_image(
     overlay_alpha: float = OVERLAY_ALPHA,
     score_percentile: int = SCORE_PERCENTILE
 ) -> dict:
-    # ELA
+    # ВАЖНО: даунскейл мы делаем ВНЕ этой функции (в /analyze), чтобы
+    # маска и оверлеи всегда считались на одном размере.
+
+    # 1) ELA
     ela = ela_map(pil)
 
-    # score_map = нормированная смесь ELA и шумовой карты, минус текст
+    # 2) score_map = ELA/Noise/Text (0..1)
     ela_f = (ela.astype(np.float32) - ela.min()) / (ela.ptp() + 1e-6)
     gray = np.array(pil.convert("L")).astype(np.float32)
     gray = (gray - gray.min()) / (gray.ptp() + 1e-6)
     noise = noise_map_from_gray((gray * 255).astype(np.uint8), k=VAR_KERNEL)
     score_map = 0.65 * ela_f + 0.35 * noise
-    tmask = text_mask(pil)
+    tmask = text_mask(pil)  # 0/255
     score_map = score_map * (1.0 - 0.5 * (tmask.astype(np.float32) / 255.0))
     score_map = (score_map - score_map.min()) / (score_map.ptp() + 1e-6)
 
-    # Маска по динамическому перцентилю чувствительности
+    # 3) Бинаризация по перцентилю + морфология + отсев шумов
     thr_dyn = float(np.percentile(score_map, score_percentile))
     mask = (score_map >= thr_dyn).astype(np.uint8) * 255
     kernel = np.ones((MASK_MORPH, MASK_MORPH), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
 
-    # Отсев маленьких участков
     h, w = mask.shape[:2]
     min_area = int(MIN_AREA_RATIO * w * h)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -296,11 +297,10 @@ def process_pil_image(
             cv2.drawContours(mask_f, [c], -1, 255, -1)
     mask = mask_f
 
-    # Зоны
+    # 4) Зоны
     regions = extract_regions(mask, score_map, max_regions=6, pad=8)
 
-    # Изображения
-    pil = downscale_if_huge(pil)
+    # 5) Визуалы
     src_rgb = np.array(pil.convert("RGB"))
     src_bgr = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2BGR)
 
@@ -324,20 +324,19 @@ def process_pil_image(
             cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 0), 1, cv2.LINE_AA
         )
 
-    # Имена файлов
+    # 6) Файлы
     stem = f"{batch}_{uuid.uuid4().hex[:6]}"
     src_name = f"{stem}_src.jpg"
     ela_name = f"{stem}_ela.jpg"
     ovl_name = f"{stem}_overlay.jpg"
     boxed_name = f"{stem}_boxed.jpg"
 
-    # Сохранение
     Image.fromarray(src_rgb).save(str(RESULTS_DIR / src_name), "JPEG", quality=95)
     Image.fromarray(cv2.cvtColor(ela_vis_bgr, cv2.COLOR_BGR2RGB)).save(str(RESULTS_DIR / ela_name), "JPEG", quality=95)
     Image.fromarray(cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)).save(str(RESULTS_DIR / ovl_name), "JPEG", quality=95)
     Image.fromarray(cv2.cvtColor(boxed_bgr, cv2.COLOR_BGR2RGB)).save(str(RESULTS_DIR / boxed_name), "JPEG", quality=95)
 
-    # Главный кроп (самая сильная зона)
+    # 7) Главный кроп
     crop_paths = []
     lead_crop_path = None
     if regions:
@@ -357,7 +356,7 @@ def process_pil_image(
                 "box": {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
             })
 
-    # Светофор + отчёт
+    # 8) Светофор + отчёт
     severity, verdict_txt = classify_severity(regions, score_map)
     report_url = create_report_pdf(
         stem=stem,
@@ -395,7 +394,7 @@ def index():
 def analyze():
     cleanup_results_dir()  # авто-очистка старых результатов
 
-    # Настройки из формы (ползунки). Если нет — берём дефолты.
+    # Настройки из формы (ползунки). Если нет — дефолты.
     ela_gain = _clamp_float(request.form.get("ela_gain"), 1.0, 1.8, ELA_GAIN)
     overlay_alpha = _clamp_float(request.form.get("overlay_alpha"), 0.2, 0.8, OVERLAY_ALPHA)
     score_percentile = _clamp_int(request.form.get("score_percentile"), 88, 98, SCORE_PERCENTILE)
