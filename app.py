@@ -141,12 +141,8 @@ def summarize_mask(mask: np.ndarray) -> tuple[float, int]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return pct, len(contours)
 
-def verdict_from_percent(p: float) -> str:
-    if p >= 10.0:
-        return "High (likely edited)"
-    if p >= 3.0:
-        return "Medium (possible edits)"
-    return "Low (no clear edits)"
+def verdict_text(has_regions: bool) -> str:
+    return "Review recommended" if has_regions else "No issues found"
 
 def overlay_suspicious(base_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
@@ -168,6 +164,23 @@ def overlay_suspicious(base_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     cv2.drawContours(overlay, contours, -1, (0, 0, 255), thickness=2)
     return overlay
 
+def extract_regions(mask: np.ndarray, score_map: np.ndarray, max_regions: int = 6, pad: int = 8):
+    """
+    Возвращает топ-зоны [{x,y,w,h,score}], отсортированные по среднему скору.
+    """
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    regs = []
+    H, W = mask.shape[:2]
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        roi = score_map[y:y+h, x:x+w]
+        sc = float(np.mean(roi)) if roi.size else 0.0
+        x0 = max(0, x - pad); y0 = max(0, y - pad)
+        x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
+        regs.append({"x": int(x0), "y": int(y0), "w": int(x1-x0), "h": int(y1-y0), "score": round(sc, 4)})
+    regs.sort(key=lambda r: r["score"], reverse=True)
+    return regs[:max_regions]
+
 def iter_pdf_pages(pdf_path: Path, dpi: int = PDF_DPI, max_pages: int = MAX_PDF_PAGES):
     """
     Памяти-бережный рендер PDF: отдаём по одной PIL-странице.
@@ -185,30 +198,47 @@ def iter_pdf_pages(pdf_path: Path, dpi: int = PDF_DPI, max_pages: int = MAX_PDF_
 def process_pil_image(pil: Image.Image, label: str, batch: str) -> dict:
     """
     Основной конвейер:
-      PIL -> ELA (ансамбль) -> комбинированная маска (ELA+noise, -text) ->
-      проценты -> вердикт -> картинки
+      PIL -> ELA -> комбинированная маска (ELA+noise, -text) ->
+      извлечение зон -> вердикт -> изображения (overlay, boxed, crops)
     """
     # 1) ELA
     ela = ela_map(pil)
 
-    # 2) подозрительная маска по комбинированному скору
+    # 2) маска по комбинированному скору
     mask = suspicious_mask_from_background(ela, pil)
 
-    # 3) проценты + аномалии
-    pct, regions = summarize_mask(mask)
-    verdict = verdict_from_percent(pct)
+    # 2b) score_map (нужен для ранжирования зон)
+    ela_f = (ela.astype(np.float32) - ela.min()) / (ela.ptp() + 1e-6)
+    gray = np.array(pil.convert("L")).astype(np.float32)
+    gray = (gray - gray.min()) / (gray.ptp() + 1e-6)
+    noise = noise_map_from_gray((gray * 255).astype(np.uint8), k=VAR_KERNEL)
+    score_map = 0.65 * ela_f + 0.35 * noise
+    tmask = text_mask(pil)
+    score_map = score_map * (1.0 - 0.5 * (tmask.astype(np.float32) / 255.0))
 
-    # 4) готовим картинки для UI
+    # 3) извлекаем топ-зоны
+    regions = extract_regions(mask, score_map, max_regions=6, pad=8)
+
+    # 4) готовим картинки
     src_rgb = np.array(pil.convert("RGB"))
     src_bgr = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2BGR)
     ela_vis_bgr = cv2.applyColorMap(ela.astype(np.uint8), cv2.COLORMAP_INFERNO)
     overlay_bgr = overlay_suspicious(src_bgr, mask)
+
+    # overlay + рамки + индексы
+    boxed_bgr = overlay_bgr.copy()
+    for idx, r in enumerate(regions, start=1):
+        x, y, w, h = r["x"], r["y"], r["w"], r["h"]
+        cv2.rectangle(boxed_bgr, (x, y), (x+w, y+h), (255, 255, 0), 2)
+        cv2.putText(boxed_bgr, f"#{idx} {r['score']:.2f}", (x, max(15, y-6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,0), 1, cv2.LINE_AA)
 
     # 5) имена файлов
     stem = f"{batch}_{uuid.uuid4().hex[:6]}"
     src_name = f"{stem}_src.jpg"
     ela_name = f"{stem}_ela.jpg"
     ovl_name = f"{stem}_overlay.jpg"
+    boxed_name = f"{stem}_boxed.jpg"
 
     # 6) сохраняем на диск
     Image.fromarray(src_rgb).save(str(RESULTS_DIR / src_name), "JPEG", quality=95)
@@ -218,19 +248,48 @@ def process_pil_image(pil: Image.Image, label: str, batch: str) -> dict:
     Image.fromarray(cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)).save(
         str(RESULTS_DIR / ovl_name), "JPEG", quality=95
     )
+    Image.fromarray(cv2.cvtColor(boxed_bgr, cv2.COLOR_BGR2RGB)).save(
+        str(RESULTS_DIR / boxed_name), "JPEG", quality=95
+    )
 
-    # 7) web-пути + плоский summary
-    summary_text = f"{verdict} — suspicious area ≈ {pct:.1f}% across {regions} region(s)."
+    # 7) сохраняем кропы зон
+    crop_paths = []
+    H, W, _ = src_rgb.shape
+    for idx, r in enumerate(regions, start=1):
+        x, y, w, h = r["x"], r["y"], r["w"], r["h"]
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(W, x + w), min(H, y + h)
+        crop = src_rgb[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        crop_name = f"{stem}_crop_{idx}.jpg"
+        Image.fromarray(crop).save(str(RESULTS_DIR / crop_name), "JPEG", quality=95)
+        crop_paths.append({
+            "index": idx,
+            "score": r["score"],
+            "url": f"/static/results/{crop_name}",
+            "box": {"x": x0, "y": y0, "w": x1-x0, "h": y1-y0}
+        })
 
+    # 8) итоговый вердикт (консервативный)
+    has_regions = len(regions) > 0
+    verdict = verdict_text(has_regions)
+
+    # 9) проценты по площади (как вспомогательная метрика)
+    pct, _ = summarize_mask(mask)
+
+    # 10) ответ
     return {
         "label": label,
         "original": f"/static/results/{src_name}",
         "ela":      f"/static/results/{ela_name}",
         "overlay":  f"/static/results/{ovl_name}",
+        "boxed":    f"/static/results/{boxed_name}",
         "verdict": verdict,
         "suspicious_percent": round(pct, 1),
-        "regions": regions,
-        "summary": summary_text,
+        "regions": len(regions),
+        "crops": crop_paths,
+        "summary": f"Top {len(regions)} region(s) highlighted. Use thumbnails to review. Suspicious area ≈ {pct:.1f}%."
     }
 
 # ----------------- Роуты -----------------
@@ -281,9 +340,11 @@ def analyze():
                 "original": f"/static/uploads/{batch}_{fname}",
                 "ela": "",
                 "overlay": "",
+                "boxed": "",
                 "verdict": "Error",
                 "suspicious_percent": 0.0,
                 "regions": 0,
+                "crops": [],
                 "summary": f"Error during analysis: {e}"
             })
 
@@ -328,9 +389,11 @@ def api_analyze():
                 "original": None,
                 "ela": "",
                 "overlay": "",
+                "boxed": "",
                 "verdict": "Error",
                 "suspicious_percent": 0.0,
                 "regions": 0,
+                "crops": [],
                 "summary": f"PDF/image render error: {e}"
             })
 
