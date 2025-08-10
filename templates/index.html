@@ -19,6 +19,7 @@
     .sub{opacity:.85; margin-bottom:16px; color:var(--muted)}
     .panel{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; margin:12px 0}
     .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:14px}
+    .thumbs{display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px}
     .imgbox{background:var(--chip); border:1px solid var(--chipLine); border-radius:10px; padding:8px}
     img{max-width:100%; border-radius:8px; display:block}
     .label{font-size:12px; opacity:.9; margin:6px 0 8px}
@@ -40,7 +41,7 @@
 </head>
 <body>
   <h1>SeaDoc Checker</h1>
-  <div class="sub">Upload maritime documents (JPG/PNG/PDF). We'll run ELA and highlight potential manipulation zones.</div>
+  <div class="sub">Upload maritime documents (JPG/PNG/PDF). We’ll run ELA + noise scoring and highlight suspicious zones with thumbnails.</div>
 
   <div class="panel">
     <form id="uploadForm" action="/analyze" method="post" enctype="multipart/form-data">
@@ -61,26 +62,43 @@
         <div class="label">{{ r.label }}</div>
 
         {% if r.original %}
-          <div class="imgbox"><img src="{{ r.original }}" alt="original"></div>
+          <div class="imgbox"><img src="{{ r.original }}" alt="Original"></div>
         {% endif %}
 
         {% if r.ela %}
-          <div class="imgbox" style="margin-top:8px"><img src="{{ r.ela }}" alt="ELA preview"></div>
+          <div class="imgbox" style="margin-top:8px"><img src="{{ r.ela }}" alt="ELA"></div>
         {% endif %}
 
-        {% if r.overlay %}
+        {% if r.boxed %}
+          <div class="imgbox" style="margin-top:8px"><img src="{{ r.boxed }}" alt="Overlay with boxes"></div>
+        {% elif r.overlay %}
           <div class="imgbox" style="margin-top:8px"><img src="{{ r.overlay }}" alt="Overlay"></div>
         {% endif %}
 
+        {% if r.crops and r.crops|length > 0 %}
+          <div style="margin-top:8px">
+            <div class="label">Suspicious regions (thumbnails)</div>
+            <div class="thumbs">
+              {% for c in r.crops %}
+                <div class="imgbox" title="#{{ c.index }} score={{ c.score }}">
+                  <img src="{{ c.url }}" alt="crop {{ c.index }}">
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        {% endif %}
+
         <div class="summary">
-          {% set v = (r.verdict or 'Low (no clear edits)')|string|lower %}
+          {% set v = (r.verdict or '')|lower %}
           <div>
             <strong>Verdict:</strong>
-            <span class="verdict-{% if 'high' in v %}high{% elif 'med' in v %}med{% else %}low{% endif %}">
-              {{ r.verdict or 'Low (no clear edits)' }}
+            <span class="{% if 'review' in v %}verdict-med{% else %}verdict-low{% endif %}">
+              {{ r.verdict or 'No issues found' }}
             </span>
           </div>
-          <div><strong>Suspicious:</strong> {{ (r.suspicious_percent or 0)|round(1) }}%</div>
+          {% if r.suspicious_percent is not none %}
+            <div><strong>Suspicious area:</strong> {{ (r.suspicious_percent or 0)|round(1) }}%</div>
+          {% endif %}
           <div><strong>Regions:</strong> {{ r.regions if r.regions is not none else 0 }}</div>
           {% if r.summary %}
             <div style="margin-top:6px">🔎 {{ r.summary }}</div>
@@ -97,11 +115,11 @@
   {% endif %}
 
   <div class="footer">
-    Tip: focus on stamps, dates and signatures — bright clusters on ELA may indicate copy-paste or retouch.
+    Tip: focus on stamps, dates and signatures — boxed areas show what needs human review.
   </div>
 
   <script>
-    // лёгкая фронтовая проверка размера (совпадает с серверным лимитом 25MB)
+    // фронтовая проверка размера (серверный лимит 25MB)
     document.getElementById('uploadForm').addEventListener('submit', function (e) {
       const files = document.getElementById('fileInput').files;
       for (let f of files) {
