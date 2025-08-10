@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -28,7 +28,6 @@
     input[type=file]{padding:8px;border-radius:10px;background:var(--bg);border:1px dashed #334155;color:var(--ink)}
     .row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}
     .hidden{display:none}
-    .pill{display:inline-flex;align-items:center;gap:8px;font-size:12px;padding:6px 10px;border-radius:999px;border:1px solid #243045;color:#cbd5e1;background:#0c1426}
 
     /* бейдж вердикта */
     .badge{display:inline-flex;align-items:center;font-weight:700;font-size:12px;border-radius:999px;padding:6px 10px;border:1px solid transparent}
@@ -40,23 +39,36 @@
     .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:10px;background:var(--accent);border:none}
     .icon-btn svg{display:block}
 
+    /* легенда типов аномалий */
+    .legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+    .legend .item{display:inline-flex;gap:8px;align-items:center;font-size:12px;color:#cbd5e1}
+    .swatch{width:16px;height:16px;border-radius:4px;border:1px solid #263247}
+    .sw-add{background:linear-gradient(135deg,#3bf 0%,#ff0 50%,#f30 100%)}      /* TURBO-ish */
+    .sw-erase{background:#ff00ff}
+    .sw-seam{background:#ff8a00}
+    .sw-cm{background:#2bffb5}
+
     @media (max-width:720px){.row{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
   <h1>SeaDoc Checker</h1>
-  <div class="sub">Upload maritime documents (JPG/PNG/PDF). We highlight suspicious zones with an acid overlay and give a simple traffic-light verdict.</div>
+  <div class="sub">
+    Загрузите морские документы (JPG/PNG/PDF). Мы подсветим подозрительные зоны «кислотным» оверлеем и дадим краткий вердикт.
+    <div class="legend">
+      <div class="item"><span class="swatch sw-add"></span><span>Add/Replace (ELA⊕Noise)</span></div>
+      <div class="item"><span class="swatch sw-erase"></span><span>Erase/Замазывание (низкая ВЧ в тексте)</span></div>
+      <div class="item"><span class="swatch sw-seam"></span><span>Seam/Шов (граница вклейки)</span></div>
+      <div class="item"><span class="swatch sw-cm"></span><span>Copy–Move (дублирование фрагмента)</span></div>
+    </div>
+  </div>
 
   <div class="panel">
-    <form id="uploadForm" action="/analyze" method="post" enctype="multipart/form-data" novalidate>
+    <form id="uploadForm" action="/analyze" method="post" enctype="multipart/form-data">
       <div class="row">
-        <input id="fileInput" type="file" name="file" multiple required accept=".jpg,.jpeg,.png,.pdf" aria-label="Choose documents to analyze">
-        <div style="display:flex;gap:8px;align-items:center">
-          <button id="submitBtn" class="btn" type="submit">Upload & Analyze</button>
-          <span class="pill" title="Privacy note">🔒 We don’t store files</span>
-        </div>
+        <input id="fileInput" type="file" name="file" multiple required accept=".jpg,.jpeg,.png,.pdf">
+        <button class="btn" type="submit">Загрузить и анализировать</button>
       </div>
-      <!-- без настроек -->
     </form>
     {% if message %}
       <div class="sub" style="margin-top:8px">{{ message }}</div>
@@ -64,14 +76,13 @@
   </div>
 
   {% if results %}
-  <div class="sub" style="margin:6px 0">Results: {{ results|length }}</div>
   <div class="grid">
     {% for r in results %}
       <div class="panel">
         <div class="row" style="grid-template-columns:1fr auto;gap:8px;margin-bottom:8px">
           <div class="label">{{ r.label }}</div>
           {% if r.report %}
-            <a class="icon-btn" href="{{ r.report }}" download aria-label="Download report" title="Download report">
+            <a class="icon-btn" href="{{ r.report }}" download title="Скачать отчёт">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M12 3v10m0 0l4-4m-4 4L8 9" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                 <path d="M4 14v4a2 2 0 002 2h12a2 2 0 002-2v-4" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -80,35 +91,43 @@
           {% endif %}
         </div>
 
+        <!-- Легенда внутри карточки (компактная) -->
+        <div class="legend" style="margin:0 0 8px 0">
+          <div class="item"><span class="swatch sw-add"></span><span>Add/Replace</span></div>
+          <div class="item"><span class="swatch sw-erase"></span><span>Erase</span></div>
+          <div class="item"><span class="swatch sw-seam"></span><span>Seam</span></div>
+          <div class="item"><span class="swatch sw-cm"></span><span>Copy–Move</span></div>
+        </div>
+
         {% if r.original %}
           {% if r.boxed or r.overlay %}
             <div class="row" style="grid-template-columns:auto auto;gap:8px;margin-bottom:8px">
               <button class="btn" type="button"
                 onclick="const card=this.closest('.panel'); card.querySelectorAll('.view-original,.view-boxed').forEach(el=>el.classList.toggle('hidden'));">
-                Toggle: Original ↔ Highlighted
+                Показать: Оригинал ↔ Подсветка
               </button>
             </div>
           {% endif %}
-          <div class="imgbox view-original"><img src="{{ r.original }}" alt="Original" loading="lazy"></div>
+          <div class="imgbox view-original"><img src="{{ r.original }}" alt="Original"></div>
         {% endif %}
 
         {% if r.ela %}
-          <div class="imgbox" style="margin-top:8px"><img src="{{ r.ela }}" alt="ELA" loading="lazy"></div>
+          <div class="imgbox" style="margin-top:8px"><img src="{{ r.ela }}" alt="ELA"></div>
         {% endif %}
 
         {% if r.boxed %}
-          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img src="{{ r.boxed }}" alt="Highlighted" loading="lazy"></div>
+          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img src="{{ r.boxed }}" alt="Highlighted"></div>
         {% elif r.overlay %}
-          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img src="{{ r.overlay }}" alt="Highlighted" loading="lazy"></div>
+          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img src="{{ r.overlay }}" alt="Highlighted"></div>
         {% endif %}
 
         {% if r.crops and r.crops|length > 0 %}
           <div style="margin-top:8px">
-            <div class="label">Suspicious regions (thumbnails)</div>
+            <div class="label">Подозрительные регионы (thumbnails)</div>
             <div class="thumbs">
               {% for c in r.crops %}
                 <div class="imgbox" title="#{{ c.index }} score={{ c.score }}">
-                  <img src="{{ c.url }}" alt="crop {{ c.index }}" loading="lazy">
+                  <img src="{{ c.url }}" alt="crop {{ c.index }}">
                 </div>
               {% endfor %}
             </div>
@@ -120,7 +139,7 @@
           {% set badge_class = 'sev-green' if sev=='green' else ('sev-yellow' if sev=='yellow' else 'sev-red') %}
           <span class="badge {{ badge_class }}">{{ r.verdict or 'All good' }}</span>
           {% if r.regions %}
-            <div style="margin-top:6px">Check the highlighted boxes for potential edits.</div>
+            <div style="margin-top:6px">Проверьте подсвеченные области — это кандидаты на редактирование/замазывание.</div>
           {% endif %}
         </div>
       </div>
@@ -129,27 +148,20 @@
   {% endif %}
 
   <div class="footer">
-    Tip: focus on stamps, dates and signatures — highlighted boxes show what needs human review.
+    Подсказка: обращайте внимание на печати, даты и подписи — там чаще всего бывают правки.
   </div>
 
   <script>
-    const form = document.getElementById('uploadForm');
-    const input = document.getElementById('fileInput');
-    const btn = document.getElementById('submitBtn');
-
-    form.addEventListener('submit', function (e) {
-      const files = input.files;
-      if (!files || files.length === 0) { e.preventDefault(); return; }
+    // фронтовая проверка размера (серверный лимит 25MB)
+    document.getElementById('uploadForm').addEventListener('submit', function (e) {
+      const files = document.getElementById('fileInput').files;
       for (let f of files) {
         if (f.size > 25 * 1024 * 1024) {
           e.preventDefault();
-          alert(`File ${f.name} is too large. Max 25MB.`);
+          alert(`Файл ${f.name} слишком большой. Макс 25MB.`);
           return;
         }
       }
-      // блокируем повторную отправку и даём фидбек
-      btn.disabled = true;
-      btn.textContent = 'Analyzing...';
     });
   </script>
 </body>
