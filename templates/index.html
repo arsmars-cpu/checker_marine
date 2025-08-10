@@ -34,7 +34,7 @@
     details{background:#0c1426; border:1px solid #1e293b; border-radius:10px; padding:10px; margin-top:10px}
     summary{cursor:pointer; color:#cbd5e1}
     pre{white-space:pre-wrap; word-break:break-word; margin:8px 0 0 0}
-    .row{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+    .row{display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center}
     @media (max-width:720px){.row{grid-template-columns:1fr}}
   </style>
 </head>
@@ -43,9 +43,9 @@
   <div class="sub">Upload maritime documents (JPG/PNG/PDF). We'll run ELA and highlight potential manipulation zones.</div>
 
   <div class="panel">
-    <form action="/analyze" method="post" enctype="multipart/form-data">
+    <form id="uploadForm" action="/analyze" method="post" enctype="multipart/form-data">
       <div class="row">
-        <input type="file" name="file" multiple required>
+        <input id="fileInput" type="file" name="file" multiple required accept=".jpg,.jpeg,.png,.pdf">
         <button class="btn" type="submit">Upload & Analyze</button>
       </div>
     </form>
@@ -60,18 +60,20 @@
       <div class="panel">
         <div class="label">{{ r.label }}</div>
 
-        <div class="imgbox"><img src="{{ r.original }}" alt="original"></div>
+        {% if r.original %}
+          <div class="imgbox"><img src="{{ r.original }}" alt="original"></div>
+        {% endif %}
 
         {% if r.ela %}
           <div class="imgbox" style="margin-top:8px"><img src="{{ r.ela }}" alt="ELA preview"></div>
         {% endif %}
 
-        {% if r.mask %}
-          <div class="imgbox" style="margin-top:8px"><img src="{{ r.mask }}" alt="Regions mask"></div>
+        {% if r.overlay %}
+          <div class="imgbox" style="margin-top:8px"><img src="{{ r.overlay }}" alt="Overlay"></div>
         {% endif %}
 
         <div class="summary">
-          {% set v = (r.verdict or 'Low')|string|lower %}
+          {% set v = (r.verdict or 'Low (no clear edits)')|string|lower %}
           <div>
             <strong>Verdict:</strong>
             <span class="verdict-{% if 'high' in v %}high{% elif 'med' in v %}med{% else %}low{% endif %}">
@@ -79,7 +81,7 @@
             </span>
           </div>
           <div><strong>Suspicious:</strong> {{ (r.suspicious_percent or 0)|round(1) }}%</div>
-          <div><strong>Regions:</strong> {{ (r.regions or [])|length }}</div>
+          <div><strong>Regions:</strong> {{ r.regions if r.regions is not none else 0 }}</div>
           {% if r.summary %}
             <div style="margin-top:6px">🔎 {{ r.summary }}</div>
           {% endif %}
@@ -95,7 +97,21 @@
   {% endif %}
 
   <div class="footer">
-    Tip: focus on stamps, dates and signatures — bright clusters on ELA may indicate copy‑paste or retouch.
+    Tip: focus on stamps, dates and signatures — bright clusters on ELA may indicate copy-paste or retouch.
   </div>
+
+  <script>
+    // лёгкая фронтовая проверка размера (совпадает с серверным лимитом 25MB)
+    document.getElementById('uploadForm').addEventListener('submit', function (e) {
+      const files = document.getElementById('fileInput').files;
+      for (let f of files) {
+        if (f.size > 25 * 1024 * 1024) {
+          e.preventDefault();
+          alert(`File ${f.name} is too large. Max 25MB.`);
+          return;
+        }
+      }
+    });
+  </script>
 </body>
 </html>
