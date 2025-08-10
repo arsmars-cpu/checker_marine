@@ -7,45 +7,53 @@
   <style>
     :root{
       --bg:#0b1220;--panel:#111827;--line:#1f2937;--ink:#e6edf3;--muted:#94a3b8;
-      --chip:#0d1322;--chipLine:#243045;--accent:#2563eb;--good:#34d399;--warn:#f59e0b;--bad:#ef4444;
+      --chip:#0d1322;--chipLine:#243045;--accent:#2563eb;--good:#22c55e;--warn:#f59e0b;--bad:#ef4444;
     }
     *{box-sizing:border-box}
     html,body{height:100%}
-    body{
-      font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;
-      margin:24px; background:var(--bg); color:var(--ink);
-    }
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;margin:24px;background:var(--bg);color:var(--ink)}
     h1{margin:0 0 8px 0}
-    .sub{opacity:.85; margin-bottom:16px; color:var(--muted)}
-    .panel{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; margin:12px 0}
-    .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:14px}
-    .thumbs{display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px}
-    .imgbox{background:var(--chip); border:1px solid var(--chipLine); border-radius:10px; padding:8px}
-    img{max-width:100%; border-radius:8px; display:block}
-    .label{font-size:12px; opacity:.9; margin:6px 0 8px}
-    .summary{font-size:13px; margin-top:8px}
+    .sub{opacity:.85;margin-bottom:16px;color:var(--muted)}
+    .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;margin:12px 0}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
+    .thumbs{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+    .imgbox{background:var(--chip);border:1px solid var(--chipLine);border-radius:10px;padding:8px}
+    img{max-width:100%;border-radius:8px;display:block}
+    .label{font-size:12px;opacity:.9;margin:6px 0 8px}
+    .summary{font-size:13px;margin-top:8px}
     .summary strong{color:#cbd5e1}
-    .verdict-low{color:var(--good)}
-    .verdict-med{color:var(--warn)}
-    .verdict-high{color:var(--bad)}
-    .footer{opacity:.7; font-size:12px; margin-top:22px; color:var(--muted)}
-    .btn{background:var(--accent); border:none; color:white; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:600}
-    .btn:disabled{opacity:.6; cursor:not-allowed}
-    input[type=file]{padding:8px; border-radius:10px; background:var(--bg); border:1px dashed #334155; color:var(--ink)}
+    .footer{opacity:.7;font-size:12px;margin-top:22px;color:var(--muted)}
+    .btn{background:var(--accent);border:none;color:white;padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:600}
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+    input[type=file]{padding:8px;border-radius:10px;background:var(--bg);border:1px dashed #334155;color:var(--ink)}
     input[type=range]{width:100%}
-    details{background:#0c1426; border:1px solid #1e293b; border-radius:10px; padding:10px; margin-top:10px}
-    summary{cursor:pointer; color:#cbd5e1}
-    pre{white-space:pre-wrap; word-break:break-word; margin:8px 0 0 0}
-    .row{display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center}
-    .controls{display:grid; grid-template-columns:repeat(3,1fr); gap:14px}
+    .row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}
+    .controls{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
     .hidden{display:none}
+
+    /* светофор */
+    .chips{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+    .chip{display:inline-flex;align-items:center;gap:6px}
+    .chip i{width:16px;height:10px;border-radius:3px;display:inline-block}
+    .chip .g{background:var(--good)} .chip .y{background:var(--warn)} .chip .r{background:var(--bad)}
+
+    /* бейдж вердикта */
+    .badge{display:inline-flex;align-items:center;font-weight:700;font-size:12px;border-radius:999px;padding:6px 10px;border:1px solid transparent}
+    .sev-green{background:rgba(34,197,94,.12);color:var(--good);border-color:rgba(34,197,94,.35)}
+    .sev-yellow{background:rgba(245,158,11,.12);color:var(--warn);border-color:rgba(245,158,11,.40)}
+    .sev-red{background:rgba(239,68,68,.12);color:var(--bad);border-color:rgba(239,68,68,.40)}
+
+    /* кнопка-иконка скачать */
+    .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:10px;background:var(--accent);border:none}
+    .icon-btn svg{display:block}
+
     @media (max-width:920px){.controls{grid-template-columns:1fr}}
     @media (max-width:720px){.row{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
   <h1>SeaDoc Checker</h1>
-  <div class="sub">Upload maritime documents (JPG/PNG/PDF). We’ll run ELA + noise scoring and highlight suspicious zones with thumbnails.</div>
+  <div class="sub">Upload maritime documents (JPG/PNG/PDF). We highlight suspicious zones with clear overlays, arrows and a simple traffic-light verdict.</div>
 
   <div class="panel">
     <form id="uploadForm" action="/analyze" method="post" enctype="multipart/form-data">
@@ -54,17 +62,17 @@
         <button class="btn" type="submit">Upload & Analyze</button>
       </div>
 
-      <!-- Controls: ELA/Overlay/Sensitivity -->
+      <!-- Controls: ELA / Overlay / Sensitivity -->
       <div class="controls" style="margin-top:12px">
         <label>
           <div class="label">ELA intensity</div>
           <input type="range" name="ela_gain" id="elaGain" min="1.0" max="1.8" step="0.05" value="1.4">
-          <div class="sub"><span id="elaGainVal">1.4</span></div>
+          <div class="sub"><span id="elaGainVal">1.40</span></div>
         </label>
         <label>
           <div class="label">Overlay opacity</div>
           <input type="range" name="overlay_alpha" id="ovAlpha" min="0.2" max="0.8" step="0.05" value="0.5">
-          <div class="sub"><span id="ovAlphaVal">0.5</span></div>
+          <div class="sub"><span id="ovAlphaVal">0.50</span></div>
         </label>
         <label>
           <div class="label">Sensitivity (percentile)</div>
@@ -82,10 +90,27 @@
   <div class="grid">
     {% for r in results %}
       <div class="panel">
+        <!-- Верхняя строка карточки: светофор + кнопка скачать -->
+        <div class="row" style="grid-template-columns:1fr auto;gap:8px;margin-bottom:8px">
+          <div class="chips">
+            <span class="chip"><i class="g"></i><span class="sub">Green</span></span>
+            <span class="chip"><i class="y"></i><span class="sub">Yellow</span></span>
+            <span class="chip"><i class="r"></i><span class="sub">Red</span></span>
+          </div>
+          {% if r.report %}
+            <a class="icon-btn" href="{{ r.report }}" download title="Download report">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M12 3v10m0 0l4-4m-4 4L8 9" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M4 14v4a2 2 0 002 2h12a2 2 0 002-2v-4" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </a>
+          {% endif %}
+        </div>
+
         <div class="label">{{ r.label }}</div>
 
         {% if r.original %}
-          <!-- toggle button -->
+          <!-- toggle Original ↔ Boxed -->
           {% if r.boxed or r.overlay %}
             <div class="row" style="grid-template-columns:auto auto;gap:8px;margin-bottom:8px">
               <button class="btn" type="button"
@@ -121,27 +146,15 @@
           </div>
         {% endif %}
 
-        <div class="summary">
-          {% set v = (r.verdict or '')|lower %}
-          <div>
-            <strong>Verdict:</strong>
-            <span class="{% if 'review' in v %}verdict-med{% else %}verdict-low{% endif %}">
-              {{ r.verdict or 'No issues found' }}
-            </span>
-          </div>
-          {% if r.suspicious_percent is not none %}
-            <div><strong>Suspicious area:</strong> {{ (r.suspicious_percent or 0)|round(1) }}%</div>
-          {% endif %}
-          <div><strong>Regions:</strong> {{ r.regions if r.regions is not none else 0 }}</div>
-          {% if r.summary %}
-            <div style="margin-top:6px">🔎 {{ r.summary }}</div>
+        <div class="summary" style="margin-top:10px">
+          {% set sev = (r.severity or 'green')|lower %}
+          {% set badge_class = 'sev-green' if sev=='green' else ('sev-yellow' if sev=='yellow' else 'sev-red') %}
+          <span class="badge {{ badge_class }}">{{ r.verdict or 'All good' }}</span>
+          {% if r.regions %}
+            <div style="margin-top:6px">Check the boxed areas for potential edits.</div>
           {% endif %}
         </div>
 
-        <details>
-          <summary>Raw</summary>
-          <pre>{{ r | tojson(indent=2) }}</pre>
-        </details>
       </div>
     {% endfor %}
   </div>
