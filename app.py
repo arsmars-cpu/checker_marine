@@ -26,23 +26,20 @@ ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".pdf"}
 JPEG_QUALITIES = (90, 95, 98)     # ансамблевый ELA
 VAR_KERNEL = 9                    # окно для локальной дисперсии
 MIN_AREA_RATIO = 0.002            # минимальная площадь пятна (0.2% от страницы)
-MASK_MORPH = 3                    # морфология для очистки маски
+MASK_MORPH = 3                    # морфология для очистки маски (тоньше)
 PDF_DPI = 300                     # рендер PDF (выше — точнее, но дольше)
-
 
 # ----------------- Утилиты -----------------
 def allowed_file(name: str) -> bool:
     return Path(name).suffix.lower() in ALLOWED_EXT
 
-
 def local_variance(gray: np.ndarray, k: int = 9) -> np.ndarray:
-    # дисперсия по окну k×k
+    """Локальная дисперсия по окну k×k."""
     gray_f = gray.astype(np.float32)
     mean = cv2.blur(gray_f, (k, k))
     sqmean = cv2.blur(gray_f * gray_f, (k, k))
     var = np.clip(sqmean - mean * mean, 0, None)
     return var
-
 
 def ela_map(pil_img: Image.Image) -> np.ndarray:
     """
@@ -53,7 +50,7 @@ def ela_map(pil_img: Image.Image) -> np.ndarray:
     maps = []
     for q in JPEG_QUALITIES:
         buf = io.BytesIO()
-        pil_rgb.save(buf, "JPEG", quality=q)
+        pil_rgb.save(buf, "JPEG", quality=q, optimize=True)
         buf.seek(0)
         resaved = Image.open(buf).convert("RGB")
         diff = ImageChops.difference(pil_rgb, resaved)
@@ -68,11 +65,26 @@ def ela_map(pil_img: Image.Image) -> np.ndarray:
     ela = np.maximum.reduce(maps)  # покомпонентный максимум
     return ela
 
+def text_mask(pil_img: Image.Image) -> np.ndarray:
+    """
+    Маска печатного текста/тонких штрихов, чтобы уменьшить ложные срабатывания.
+    Возвращает uint8 (0/255).
+    """
+    g = np.array(pil_img.convert("L"))
+    thr = cv2.adaptiveThreshold(
+        g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 21, 7
+    )
+    # подчистим тонкие штрихи шрифта и немного расширим
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+    txt = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
+    txt = cv2.dilate(txt, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), 1)
+    return txt
 
 def suspicious_mask_from_background(ela_gray: np.ndarray) -> np.ndarray:
     """
     Выделяем именно однородные/плоские пятна фона.
-    1) Строим карту локальной дисперсии (на исходном ELA).
+    1) Строим карту локальной дисперсии (на ELA).
     2) Адаптивный порог: берём клетки с низкой вариативностью.
     3) Чистим морфологией + фильтруем по площади.
     """
@@ -85,11 +97,11 @@ def suspicious_mask_from_background(ela_gray: np.ndarray) -> np.ndarray:
     # инвертируем: низкая вариативность -> высокая маска
     inv = cv2.bitwise_not(var)
 
-    # порог адаптивный по статистике кадра
+    # порог по статистике кадра (жёстче, чтобы меньше «снега»)
     med = np.median(inv)
     q1, q3 = np.percentile(inv, [25, 75])
     iqr = max(1.0, q3 - q1)
-    thr = int(min(255, med + 1.25 * iqr))  # можно подкрутить 1.25..1.75
+    thr = int(min(255, med + 1.6 * iqr))  # было 1.5 — стало устойчивее
     _, mask = cv2.threshold(inv, thr, 255, cv2.THRESH_BINARY)
 
     # морф. очистка
@@ -107,14 +119,12 @@ def suspicious_mask_from_background(ela_gray: np.ndarray) -> np.ndarray:
             cv2.drawContours(out, [c], -1, 255, thickness=-1)
     return out
 
-
 def summarize_mask(mask: np.ndarray) -> tuple[float, int]:
     total = mask.size
     pos = int((mask > 0).sum())
     pct = 100.0 * pos / max(1, total)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return pct, len(contours)
-
 
 def verdict_from_percent(p: float) -> str:
     if p >= 10.0:
@@ -123,12 +133,12 @@ def verdict_from_percent(p: float) -> str:
         return "Medium (possible edits)"
     return "Low (no clear edits)"
 
-
-def overlay_suspicious(base_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def overlay_suspicious(base_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
     Рисуем полупрозрачную заливку по подозрительным зонам + контур.
+    base_bgr — изображение в цветовом пространстве BGR.
     """
-    overlay = base_rgb.copy()
+    overlay = base_bgr.copy()
     color = (0, 140, 255)  # BGR
     alpha = 0.35
 
@@ -143,7 +153,6 @@ def overlay_suspicious(base_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     cv2.drawContours(overlay, contours, -1, (0, 0, 255), thickness=2)
     return overlay
 
-
 def render_pdf_to_images(pdf_path: Path, dpi: int = PDF_DPI) -> list[Image.Image]:
     pages = []
     with fitz.open(str(pdf_path)) as doc:
@@ -153,11 +162,10 @@ def render_pdf_to_images(pdf_path: Path, dpi: int = PDF_DPI) -> list[Image.Image
             pages.append(img)
     return pages
 
-
 def process_pil_image(pil: Image.Image, label: str, batch: str) -> dict:
     """
     Основной конвейер:
-      PIL -> ELA (ансамбль) -> маска ровных пятен -> проценты -> verdict -> картинки
+      PIL -> ELA (ансамбль) -> маска ровных пятен -> приглушение текста -> проценты -> вердикт -> картинки
     """
     # 1) ELA
     ela = ela_map(pil)
@@ -165,27 +173,37 @@ def process_pil_image(pil: Image.Image, label: str, batch: str) -> dict:
     # 2) подозрительная маска (только по фону)
     mask = suspicious_mask_from_background(ela)
 
-    # 3) проценты + аномалии
+    # 3) приглушаем обычный печатный текст (но не печати/подписи)
+    tmask = text_mask(pil)  # 0/255
+    tmask_scaled = (tmask.astype(np.float32) * 0.5).astype(np.uint8)  # было 0.6
+    mask = cv2.subtract(mask, tmask_scaled)
+
+    # 4) проценты + аномалии
     pct, regions = summarize_mask(mask)
     verdict = verdict_from_percent(pct)
 
-    # 4) готовим картинки для UI
-    src = np.array(pil.convert("RGB"))
-    ela_vis = cv2.applyColorMap(ela.astype(np.uint8), cv2.COLORMAP_INFERNO)
-    overlay = overlay_suspicious(src, mask)
+    # 5) готовим картинки для UI
+    src_rgb = np.array(pil.convert("RGB"))
+    src_bgr = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2BGR)
+    ela_vis_bgr = cv2.applyColorMap(ela.astype(np.uint8), cv2.COLORMAP_INFERNO)
+    overlay_bgr = overlay_suspicious(src_bgr, mask)
 
-    # 5) имена файлов
+    # 6) имена файлов
     stem = f"{batch}_{uuid.uuid4().hex[:6]}"
     src_name = f"{stem}_src.jpg"
     ela_name = f"{stem}_ela.jpg"
     ovl_name = f"{stem}_overlay.jpg"
 
-    # 6) сохраняем на диск
-    Image.fromarray(src).save(str(RESULTS_DIR / src_name), "JPEG", quality=95)
-    Image.fromarray(cv2.cvtColor(ela_vis, cv2.COLOR_BGR2RGB)).save(str(RESULTS_DIR / ela_name), "JPEG", quality=95)
-    Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)).save(str(RESULTS_DIR / ovl_name), "JPEG", quality=95)
+    # 7) сохраняем на диск
+    Image.fromarray(src_rgb).save(str(RESULTS_DIR / src_name), "JPEG", quality=95)
+    Image.fromarray(cv2.cvtColor(ela_vis_bgr, cv2.COLOR_BGR2RGB)).save(
+        str(RESULTS_DIR / ela_name), "JPEG", quality=95
+    )
+    Image.fromarray(cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)).save(
+        str(RESULTS_DIR / ovl_name), "JPEG", quality=95
+    )
 
-    # 7) web‑пути + плоский summary
+    # 8) web-пути + плоский summary
     summary_text = f"{verdict} — suspicious area ≈ {pct:.1f}% across {regions} region(s)."
 
     return {
@@ -199,12 +217,10 @@ def process_pil_image(pil: Image.Image, label: str, batch: str) -> dict:
         "summary": summary_text,
     }
 
-
 # ----------------- Роуты -----------------
 @app.route("/", methods=["GET"])
 def index():
     return render_template("index.html", results=[])
-
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
@@ -247,7 +263,6 @@ def analyze():
             })
 
     return render_template("index.html", results=results, message=f"Batch {batch}: processed {len(results)} item(s).")
-
 
 # API для бота/интеграций
 @app.post("/api/analyze")
@@ -293,11 +308,9 @@ def api_analyze():
 
     return jsonify({"ok": True, "batch": batch, "results": out})
 
-
 @app.get("/health")
 def health():
     return "ok", 200
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
