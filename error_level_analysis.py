@@ -91,7 +91,8 @@ def text_mask(pil_img: Image.Image) -> np.ndarray:
                                 cv2.THRESH_BINARY_INV, 21, 7)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     txt = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    txt = cv2.dilate(txt, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), 1)
+    # 🔧 FIX: правильный вызов dilate — первым аргументом идёт изображение, а не ядро
+    txt = cv2.dilate(txt, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
     return (txt > 0).astype(np.float32)
 
 
