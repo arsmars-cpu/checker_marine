@@ -62,7 +62,8 @@ def ela_ensemble_gray(pil_img: Image.Image) -> np.ndarray:
     arrs = [_ela_single(pil_img, q) for q in ELA_QUALS]
     ela = np.mean(arrs, axis=0)
     ela_gray = np.sqrt(np.sum(ela ** 2, axis=2))
-    ela_gray = (ela_gray - ela_gray.min()) / (ela_gray.ptp() + 1e-6)
+    # NumPy 2.0: используем np.ptp
+    ela_gray = (ela_gray - ela_gray.min()) / (np.ptp(ela_gray) + 1e-6)
     return (ela_gray * 255.0 + 0.5).astype(np.uint8)
 
 
@@ -75,7 +76,7 @@ def _local_variance(gray: np.ndarray, k: int = VAR_KERNEL) -> np.ndarray:
 
 def noise_map_from_gray(gray_u8: np.ndarray, k: int = VAR_KERNEL) -> np.ndarray:
     var = _local_variance(gray_u8, k)
-    var = (var - var.min()) / (var.ptp() + 1e-6)
+    var = (var - var.min()) / (np.ptp(var) + 1e-6)
     return 1.0 - var
 
 
@@ -94,12 +95,12 @@ def fused_score(pil_img: Image.Image) -> np.ndarray:
     ela = ela_u8.astype(np.float32) / 255.0
 
     g = np.asarray(pil_img.convert('L')).astype(np.float32)
-    g = (g - g.min()) / (g.ptp() + 1e-6)
+    g = (g - g.min()) / (np.ptp(g) + 1e-6)
     noise = noise_map_from_gray((g * 255).astype(np.uint8), k=VAR_KERNEL)
 
     score = SCORE_W_ELA * ela + SCORE_W_NOISE * noise
     score = score * (1.0 - TEXT_SUPPRESS * text_mask(pil_img))
-    score = (score - score.min()) / (score.ptp() + 1e-6)
+    score = (score - score.min()) / (np.ptp(score) + 1e-6)
     return score.astype(np.float32)
 
 
@@ -131,7 +132,7 @@ def _local_zscore(score: np.ndarray, sigma: float = 6.0) -> np.ndarray:
     var = np.maximum(mu2 - mu * mu, 1e-6)
     z = (score - mu) / np.sqrt(var)
     z = np.clip(z, 0, None)
-    z = (z - z.min()) / (z.ptp() + 1e-6)
+    z = (z - z.min()) / (np.ptp(z) + 1e-6)
     return z.astype(np.float32)
 
 
@@ -359,7 +360,6 @@ def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Di
 
     verdict, severity, suspicious_pct = verdict_from_maps(scr, mask, regs)
 
-    # web-пути под статику
     to_web = lambda name: f"/static/results/{Path(name).name}"
 
     return {
