@@ -9,7 +9,10 @@ from werkzeug.utils import secure_filename
 from PIL import Image, ImageFile
 import fitz  # PyMuPDF
 
-from utils import process_pil_image, iter_pdf_pages  # наш пайплайн
+# новый пайплайн
+from error_level_analysis import run_image
+# оставляем только итератор по PDF из utils (если он у тебя есть)
+from utils import iter_pdf_pages
 
 # --------- конфиг ---------
 BASE_DIR = Path(__file__).parent
@@ -86,14 +89,15 @@ def analyze():
         try:
             ext = Path(fname).suffix.lower()
             if ext == ".pdf":
+                # если есть utils.iter_pdf_pages — используем его
                 for i, pimg in iter_pdf_pages(upath):
                     pimg = downscale_if_huge(pimg)
-                    res = process_pil_image(pimg, f"{fname} — page {i}", batch)
+                    res = run_image(pimg.convert("RGB"), f"{fname} — page {i}", batch, RESULTS_DIR)
                     results.append(res)
             else:
                 pil = Image.open(str(upath)).convert("RGB")
                 pil = downscale_if_huge(pil)
-                res = process_pil_image(pil, fname, batch)
+                res = run_image(pil, fname, batch, RESULTS_DIR)
                 results.append(res)
         except Exception as e:
             app.logger.exception(f"Analyze error: {fname} | {e}")
@@ -134,11 +138,11 @@ def api_analyze():
                         pix = doc[i].get_pixmap(alpha=False)
                         pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         pil = downscale_if_huge(pil)
-                        out.append(process_pil_image(pil, f"{fname} — page {i+1}", batch))
+                        out.append(run_image(pil, f"{fname} — page {i+1}", batch, RESULTS_DIR))
             else:
                 pil = Image.open(f.stream).convert("RGB")
                 pil = downscale_if_huge(pil)
-                out.append(process_pil_image(pil, fname, batch))
+                out.append(run_image(pil, fname, batch, RESULTS_DIR))
         except Exception as e:
             app.logger.exception(f"/api analyze error: {fname} | {e}")
             out.append({
