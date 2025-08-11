@@ -17,16 +17,16 @@ ELA_QUALS: Tuple[int, ...] = (90, 95, 98)
 
 # Сегментация (усилили чувствительность)
 VAR_KERNEL: int = 9               # окно локальной дисперсии
-MIN_AREA_RATIO: float = 0.0005    # было 0.0008/0.002 — ловим мельче (~0.05% кадра)
-MASK_MORPH: int = 3               # было 5 — меньше «склейки», тоньше детали
-SCORE_W_ELA: float = 0.65         # вес ELA
-SCORE_W_NOISE: float = 0.35       # вес noise
-TEXT_SUPPRESS: float = 0.25       # было 0.35/0.5 — меньше глушим текст (часто правят текст)
-DEFAULT_PERCENTILE: int = 92      # было 93/95 — мягче порог
+MIN_AREA_RATIO: float = 0.0002    # ловим мельче (~0.02% кадра)
+MASK_MORPH: int = 5               # чуть больше склейка мелких разрывов
+SCORE_W_ELA: float = 0.65
+SCORE_W_NOISE: float = 0.35
+TEXT_SUPPRESS: float = 0.15       # меньше глушим текст (часто правят текст)
+DEFAULT_PERCENTILE: int = 90      # мягче порог
 
 # Визуал
 COLORMAP: int = cv2.COLORMAP_TURBO
-ELA_GAIN: float = 1.5
+ELA_GAIN: float = 1.7             # ELA ярче
 ELA_GAMMA: float = 0.85
 ELA_USE_CLAHE: bool = True
 OVERLAY_ALPHA: float = 0.58
@@ -91,7 +91,6 @@ def text_mask(pil_img: Image.Image) -> np.ndarray:
                                 cv2.THRESH_BINARY_INV, 21, 7)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     txt = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    # корректный вызов dilate
     txt = cv2.dilate(txt, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
     return (txt > 0).astype(np.float32)
 
@@ -122,7 +121,7 @@ def fused_score(pil_img: Image.Image) -> np.ndarray:
     return score.astype(np.float32)
 
 
-# ===== Сегментация ============================================================
+# ===== Сегментация + фолбэки =================================================
 
 def _build_mask_from_percentiles(score: np.ndarray,
                                  percentiles: Union[int, List[int], Tuple[int, ...]],
@@ -145,20 +144,43 @@ def _build_mask_from_percentiles(score: np.ndarray,
     return mask
 
 
+def _hot_windows(score: np.ndarray, k: int = 3, win: int = 48) -> List[Dict]:
+    """Safety‑net: берём k самых «горячих» окон win×win без сильного перекрытия."""
+    H, W = score.shape
+    heat = cv2.GaussianBlur(score, (0, 0), 2)
+    regs: List[Dict] = []
+    taken = np.zeros_like(score, dtype=np.uint8)
+
+    for _ in range(k):
+        yx = np.unravel_index(np.argmax(heat * (1 - taken)), heat.shape)
+        y, x = int(yx[0]), int(yx[1])
+        x0 = max(0, x - win // 2); y0 = max(0, y - win // 2)
+        x1 = min(W, x0 + win);     y1 = min(H, y0 + win)
+        roi = score[y0:y1, x0:x1]
+        if roi.size == 0 or float(roi.max()) < 0.2:
+            break
+        regs.append({"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0,
+                     "score": float(roi.mean())})
+        taken[y0:y1, x0:x1] = 1
+    return regs
+
+
 def regions_from_score(score: np.ndarray,
-                       percentile: Union[int, List[int], Tuple[int, ...]] = (88, 92, 96),
+                       percentile: Union[int, List[int], Tuple[int, ...]] = (85, 90, 95, 97),
                        morph: int = MASK_MORPH,
                        min_area_ratio: float = MIN_AREA_RATIO,
                        pad: int = 8,
                        top_k: int = 6) -> Tuple[np.ndarray, List[Dict]]:
     """
     score (0..1) → бинарная маска (uint8 0/255) + топ-регионы [{x,y,w,h,score}].
-    По умолчанию берём объединение нескольких перцентилей — ловим и тонкие, и «жирные» правки.
+
+    Используем объединение нескольких перцентилей — ловим и «жирные» вмешательства,
+    и тонкие правки. Если пусто — включаем два фолбэка.
     """
     H, W = score.shape
     mask = _build_mask_from_percentiles(score, percentile, morph)
 
-    # фильтр по площади
+    # контуры + отсев по площади
     min_area = int(min_area_ratio * H * W)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -176,13 +198,22 @@ def regions_from_score(score: np.ndarray,
     regs.sort(key=lambda r: r["score"], reverse=True)
     regs = regs[:top_k]
 
-    # Fallback: если ничего не нашли — всё равно подсветим самые «горячие» области
+    # Fallback 1: горячие блоки помельче
     if not regs:
-        # грубая маска по верхнему перцентилю для визуала
-        mask = _build_mask_from_percentiles(score, 96, morph=0)
-        # возьмём несколько горячих блоков
-        hot = block_report(score, block=32, top_k=min(3, top_k))
-        regs = [{"x": h["x"], "y": h["y"], "w": h["w"], "h": h["h"], "score": h["score"]} for h in hot]
+        block = 16
+        boxes = []
+        for by in range(0, H, block):
+            for bx in range(0, W, block):
+                s = score[by:min(by+block,H), bx:min(bx+block,W)]
+                if s.size == 0:
+                    continue
+                boxes.append((float(s.mean()), bx, by, min(block, W-bx), min(block, H-by)))
+        boxes.sort(reverse=True, key=lambda t: t[0])
+        regs = [{"x": x, "y": y, "w": w, "h": h, "score": round(v,4)} for v,x,y,w,h in boxes[:min(3, top_k)]]
+
+    # Fallback 2: окна вокруг глобальных максимумов
+    if not regs:
+        regs = _hot_windows(score, k=min(3, top_k), win=48)
 
     return mask, regs
 
@@ -266,16 +297,13 @@ def save_visuals_and_crops(pil_img: Image.Image,
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ELA (BGR)
     if ela_u8 is None:
         ela_u8 = ela_ensemble_gray(pil_img)
     ela_bgr = make_ela_visual(ela_u8, gain=ela_gain, gamma=ela_gamma, use_clahe=use_clahe, colormap=colormap)
 
-    # Overlay/Boxed (BGR)
     over_bgr = acid_overlay_on_original(pil_img, score, regions, alpha=OVERLAY_ALPHA, colormap=colormap)
     boxed_bgr = over_bgr.copy()
 
-    # Сохраняем BGR напрямую (без конверта в RGB)
     ela_name   = f"{stem}_ela.jpg"
     ovl_name   = f"{stem}_overlay.jpg"
     boxed_name = f"{stem}_boxed.jpg"
@@ -283,7 +311,6 @@ def save_visuals_and_crops(pil_img: Image.Image,
     cv2.imwrite(str(out_dir / ovl_name),   over_bgr,  [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     cv2.imwrite(str(out_dir / boxed_name), boxed_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
-    # «лид»-кроп
     crops = []
     if regions:
         src = np.asarray(pil_img.convert('RGB'))
