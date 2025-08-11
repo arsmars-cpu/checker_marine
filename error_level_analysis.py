@@ -13,17 +13,16 @@ from PIL import Image, ImageChops, ImageEnhance
 
 # ===== Параметры ==============================================================
 
-# Ансамбль ELA по нескольким JPEG-качествам
 ELA_QUALS: Tuple[int, ...] = (90, 95, 98)
 
-# Сегментация (усилили чувствительность)
-VAR_KERNEL: int = 9               # окно локальной дисперсии
-MIN_AREA_RATIO: float = 0.00005   # ловим мельчайшие зоны (~0.005% кадра)
-MASK_MORPH: int = 5               # склеиваем разрывы построчного текста
+# Сегментация (чувствительная, с фолбэками)
+VAR_KERNEL: int = 9
+MIN_AREA_RATIO: float = 0.00005
+MASK_MORPH: int = 5
 SCORE_W_ELA: float = 0.65
 SCORE_W_NOISE: float = 0.35
-TEXT_SUPPRESS: float = 0.15       # почти не глушим текст
-DEFAULT_PERCENTILE: int = 90      # базовый порог мягче
+TEXT_SUPPRESS: float = 0.15
+DEFAULT_PERCENTILE: int = 90
 
 # Визуал
 COLORMAP: int = cv2.COLORMAP_TURBO
@@ -38,7 +37,6 @@ BOX_THICK: int = 2
 CONTOUR_THICK: int = 2
 ARROW_THICK: int = 2
 
-# Старый блочный отчёт (если нужно)
 BLOCK: int = 24
 
 
@@ -92,7 +90,6 @@ def text_mask(pil_img: Image.Image) -> np.ndarray:
 
 
 def fused_score(pil_img: Image.Image) -> np.ndarray:
-    """0..1: ELA ⊕ Noise с приглушением печатного текста."""
     ela_u8 = ela_ensemble_gray(pil_img)
     ela = ela_u8.astype(np.float32) / 255.0
 
@@ -129,12 +126,11 @@ def _build_mask_from_percentiles(score: np.ndarray,
 
 
 def _local_zscore(score: np.ndarray, sigma: float = 6.0) -> np.ndarray:
-    """Насколько точка «горяча» относительно своего окружения."""
     mu  = cv2.GaussianBlur(score, (0, 0), sigma)
     mu2 = cv2.GaussianBlur(score * score, (0, 0), sigma)
     var = np.maximum(mu2 - mu * mu, 1e-6)
     z = (score - mu) / np.sqrt(var)
-    z = np.clip(z, 0, None)  # отрицательное неинтересно
+    z = np.clip(z, 0, None)
     z = (z - z.min()) / (z.ptp() + 1e-6)
     return z.astype(np.float32)
 
@@ -162,11 +158,6 @@ def regions_from_score(score: np.ndarray,
                        min_area_ratio: float = MIN_AREA_RATIO,
                        pad: int = 12,
                        top_k: int = 6) -> Tuple[np.ndarray, List[Dict]]:
-    """
-    score (0..1) → бинарная маска (uint8 0/255) + регионы [{x,y,w,h,score}].
-    Объединяем «абсолютную» карту и локальный z‑score для устойчивости.
-    """
-    # усиливаем локальные «аномалии» относительно окружения
     used = np.clip(0.6 * score + 0.4 * _local_zscore(score), 0, 1)
 
     H, W = used.shape
@@ -189,9 +180,7 @@ def regions_from_score(score: np.ndarray,
     regs.sort(key=lambda r: r["score"], reverse=True)
     regs = regs[:top_k]
 
-    # Фолбэки на случай пустоты
     if not regs:
-        # 1) горячие блоки помельче
         block = 16
         boxes = []
         for by in range(0, H, block):
@@ -204,7 +193,6 @@ def regions_from_score(score: np.ndarray,
         regs = [{"x": x, "y": y, "w": w, "h": h, "score": round(v, 4)} for v, x, y, w, h in boxes[:min(3, top_k)]]
 
     if not regs:
-        # 2) окна вокруг глобальных максимумов
         regs = _hot_windows(used, k=min(3, top_k), win=48)
 
     return mask, regs
@@ -330,17 +318,12 @@ def block_report(score: np.ndarray, block: int = BLOCK, top_k: int = 8) -> List[
     ]
 
 
-# ===== Вердикт + удобный раннер ==============================================
+# ===== Вердикт + раннер =======================================================
 
 def verdict_from_maps(score: np.ndarray,
                       mask: np.ndarray,
                       regions: List[Dict]) -> Tuple[str, str, float]:
-    """
-    (verdict_text, severity_color, suspicious_percent)
-    severity_color: 'green' | 'yellow' | 'red'
-    """
     suspicious_pct = 100.0 * float((mask > 0).sum()) / float(mask.size)
-
     n = len(regions)
     max_sc = float(score.max()) if score.size else 0.0
     mean_top = float(np.mean([r["score"] for r in regions[:3]])) if n else 0.0
@@ -357,38 +340,43 @@ def verdict_from_maps(score: np.ndarray,
 
 def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Dict:
     """
-    Считает fused score, регионы, визуалы; сохраняет оригинал и возвращает dict для index.html.
+    Единая точка входа: строит score/регионы, сохраняет оригинал/визуалы,
+    возвращает dict под index.html (пути — web /static/...).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Сохранить оригинал
     stem = f"{batch}_{uuid.uuid4().hex[:6]}"
     orig_name = f"{stem}_src.jpg"
     Image.fromarray(np.asarray(pil_img.convert("RGB"))).save(out_dir / orig_name, "JPEG", quality=95)
 
-    # Карты/регионы
     scr = fused_score(pil_img)
     mask, regs = regions_from_score(scr, percentile=(82, 88, 94, 97))
 
-    # Визуалы
     ela_u8 = ela_ensemble_gray(pil_img)
     ela_name, ovl_name, boxed_name, crops = save_visuals_and_crops(
         pil_img, scr, regs, out_dir, stem, ela_u8=ela_u8
     )
 
-    # Вердикт
     verdict, severity, suspicious_pct = verdict_from_maps(scr, mask, regs)
 
+    # web-пути под статику
+    to_web = lambda name: f"/static/results/{Path(name).name}"
+
     return {
-        "label": label,
-        "original": str(out_dir / orig_name).replace("\\", "/"),
-        "ela":      str(out_dir / ela_name).replace("\\", "/"),
-        "overlay":  str(out_dir / ovl_name).replace("\\", "/"),
-        "boxed":    str(out_dir / boxed_name).replace("\\", "/"),
-        "verdict": verdict,
+        "label":   label,
+        "original": to_web(orig_name),
+        "ela":      to_web(ela_name),
+        "overlay":  to_web(ovl_name),
+        "boxed":    to_web(boxed_name),
+        "verdict":  verdict,
         "severity": severity,
-        "regions": len(regs),
-        "crops": [{"index": c["index"], "score": c["score"],
-                   "url": str(out_dir / c["filename"]).replace("\\", "/")} for c in crops],
-        "summary": f"{verdict} — suspicious area ≈ {suspicious_pct:.2f}% across {len(regs)} region(s)."
+        "regions":  len(regs),
+        "crops": [
+            {"index": i + 1, "score": r["score"],
+             "url": to_web(crops[0]["filename"]) if (i == 0 and crops) else "",
+             "box": {"x": r["x"], "y": r["y"], "w": r["w"], "h": r["h"]}}
+            for i, r in enumerate(regs)
+        ],
+        "summary": f"{verdict} — suspicious area ≈ {suspicious_pct:.2f}% across {len(regs)} region(s).",
+        "report":  ""
     }
