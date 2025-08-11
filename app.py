@@ -9,13 +9,9 @@ from werkzeug.utils import secure_filename
 from PIL import Image, ImageFile
 import fitz  # PyMuPDF
 
-# наш новый пайплайн берём из utils.py
-from utils import (
-    process_pil_image,
-    iter_pdf_pages,
-)
+from utils import process_pil_image, iter_pdf_pages  # наш пайплайн
 
-# ----------------- Конфиг -----------------
+# --------- конфиг ---------
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "static" / "uploads"
 RESULTS_DIR = BASE_DIR / "static" / "results"
@@ -23,38 +19,36 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB per request
-# чтобы шаблон не кэшировался в дев/на Render
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".pdf"}
 
-# Безопасная загрузка больших изображений
+# безопасная загрузка больших изображений
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
 
-# Хаускипинг / приватность
+# housekeeping
 MAX_RESULT_AGE_HOURS = 3
 MAX_LONG_EDGE = 4800
+
 
 def allowed_file(name: str) -> bool:
     return bool(name) and Path(name).suffix.lower() in ALLOWED_EXT
 
+
 def cleanup_results_dir(max_age_hours: int = MAX_RESULT_AGE_HOURS):
     cutoff = time.time() - max_age_hours * 3600
-    removed = 0
     for p in RESULTS_DIR.glob("*"):
-        if p.suffix.lower() not in {".jpg", ".jpeg", ".png", ".pdf"}:
+        if p.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             continue
         try:
             if p.stat().st_mtime < cutoff:
                 p.unlink(missing_ok=True)
-                removed += 1
         except Exception:
             pass
-    if removed:
-        app.logger.info(f"Cleanup: removed {removed} old result file(s)")
+
 
 def downscale_if_huge(pil_img: Image.Image, max_long_edge: int = MAX_LONG_EDGE) -> Image.Image:
     w, h = pil_img.size
@@ -62,13 +56,14 @@ def downscale_if_huge(pil_img: Image.Image, max_long_edge: int = MAX_LONG_EDGE) 
     if m <= max_long_edge:
         return pil_img
     scale = max_long_edge / float(m)
-    new_size = (int(w * scale), int(h * scale))
-    return pil_img.resize(new_size, Image.LANCZOS)
+    return pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-# ----------------- Роуты -----------------
+
+# --------- роуты ---------
 @app.get("/")
 def index():
     return render_template("index.html", results=[])
+
 
 @app.post("/analyze")
 def analyze():
@@ -116,6 +111,7 @@ def analyze():
 
     return render_template("index.html", results=results, message=f"Batch {batch}: processed {len(results)} item(s).")
 
+
 @app.post("/api/analyze")
 def api_analyze():
     cleanup_results_dir()
@@ -159,9 +155,11 @@ def api_analyze():
 
     return jsonify({"ok": True, "batch": batch, "results": out})
 
+
 @app.get("/health")
 def health():
     return "ok", 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
