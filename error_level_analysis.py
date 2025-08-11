@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Tuple, Union
 import io
+import uuid
 
 import numpy as np
 import cv2
@@ -327,3 +328,67 @@ def block_report(score: np.ndarray, block: int = BLOCK, top_k: int = 8) -> List[
         {"score": round(v, 4), "x": x, "y": y, "w": w, "h": h}
         for v, x, y, w, h in boxes[:top_k]
     ]
+
+
+# ===== Вердикт + удобный раннер ==============================================
+
+def verdict_from_maps(score: np.ndarray,
+                      mask: np.ndarray,
+                      regions: List[Dict]) -> Tuple[str, str, float]:
+    """
+    (verdict_text, severity_color, suspicious_percent)
+    severity_color: 'green' | 'yellow' | 'red'
+    """
+    suspicious_pct = 100.0 * float((mask > 0).sum()) / float(mask.size)
+
+    n = len(regions)
+    max_sc = float(score.max()) if score.size else 0.0
+    mean_top = float(np.mean([r["score"] for r in regions[:3]])) if n else 0.0
+
+    is_red = (n >= 2 and mean_top >= 0.45) or (n >= 1 and max_sc >= 0.60 and suspicious_pct >= 0.05)
+    is_yellow = (n >= 1 and mean_top >= 0.30) or (max_sc >= 0.50)
+
+    if is_red:
+        return "High (likely edited)", "red", round(suspicious_pct, 2)
+    if is_yellow:
+        return "Medium (possible edits)", "yellow", round(suspicious_pct, 2)
+    return "Low (no clear edits)", "green", round(suspicious_pct, 2)
+
+
+def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Dict:
+    """
+    Считает fused score, регионы, визуалы; сохраняет оригинал и возвращает dict для index.html.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Сохранить оригинал
+    stem = f"{batch}_{uuid.uuid4().hex[:6]}"
+    orig_name = f"{stem}_src.jpg"
+    Image.fromarray(np.asarray(pil_img.convert("RGB"))).save(out_dir / orig_name, "JPEG", quality=95)
+
+    # Карты/регионы
+    scr = fused_score(pil_img)
+    mask, regs = regions_from_score(scr, percentile=(82, 88, 94, 97))
+
+    # Визуалы
+    ela_u8 = ela_ensemble_gray(pil_img)
+    ela_name, ovl_name, boxed_name, crops = save_visuals_and_crops(
+        pil_img, scr, regs, out_dir, stem, ela_u8=ela_u8
+    )
+
+    # Вердикт
+    verdict, severity, suspicious_pct = verdict_from_maps(scr, mask, regs)
+
+    return {
+        "label": label,
+        "original": str(out_dir / orig_name).replace("\\", "/"),
+        "ela":      str(out_dir / ela_name).replace("\\", "/"),
+        "overlay":  str(out_dir / ovl_name).replace("\\", "/"),
+        "boxed":    str(out_dir / boxed_name).replace("\\", "/"),
+        "verdict": verdict,
+        "severity": severity,
+        "regions": len(regs),
+        "crops": [{"index": c["index"], "score": c["score"],
+                   "url": str(out_dir / c["filename"]).replace("\\", "/")} for c in crops],
+        "summary": f"{verdict} — suspicious area ≈ {suspicious_pct:.2f}% across {len(regs)} region(s)."
+    }
