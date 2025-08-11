@@ -10,19 +10,19 @@ import numpy as np
 import cv2
 from PIL import Image, ImageChops, ImageEnhance
 
-# ===== Параметры (тюним при надобности) =====================================
+# ===== Параметры ==============================================================
 
 # Ансамбль ELA по нескольким JPEG-качествам
 ELA_QUALS: Tuple[int, ...] = (90, 95, 98)
 
 # Сегментация
-VAR_KERNEL: int = 9             # окно локальной дисперсии для noise
-MIN_AREA_RATIO: float = 0.002   # отсев слишком мелких пятен (доля от площади)
+VAR_KERNEL: int = 9             # окно локальной дисперсии
+MIN_AREA_RATIO: float = 0.002   # отсев мелких пятен (доля от площади)
 MASK_MORPH: int = 3             # морфология (ядро)
 SCORE_W_ELA: float = 0.65       # вес ELA в общей карте
-SCORE_W_NOISE: float = 0.35     # вес noise в общей карте
+SCORE_W_NOISE: float = 0.35     # вес карты «непохожести» шума
 TEXT_SUPPRESS: float = 0.5      # подавление печатного текста в score
-DEFAULT_PERCENTILE: int = 95    # чувствительность (верхний перцентиль)
+DEFAULT_PERCENTILE: int = 95    # чувствительность (порог по перцентилю)
 
 # Визуал
 COLORMAP: int = cv2.COLORMAP_TURBO
@@ -30,27 +30,27 @@ ELA_GAIN: float = 1.5           # усиление ELA-визуала (1.2..1.8)
 ELA_GAMMA: float = 0.85         # гамма (ниже -> светлее)
 ELA_USE_CLAHE: bool = True      # локальный контраст для ELA
 OVERLAY_ALPHA: float = 0.58     # «кислотность» оверлея
-BOX_COLOR = (255, 255, 0)       # желтые рамки
-CONTOUR_COLOR = (0, 0, 255)     # красные контуры
-ARROW_COLOR = (255, 255, 255)   # белые стрелки
+BOX_COLOR = (255, 255, 0)       # BGR: жёлтые рамки
+CONTOUR_COLOR = (0, 0, 255)     # BGR: красные контуры
+ARROW_COLOR = (255, 255, 255)   # BGR: белые стрелки
 BOX_THICK: int = 2
 CONTOUR_THICK: int = 2
 ARROW_THICK: int = 2
 
-# Старый блочный отчёт (если нужно где-то)
+# Старый блочный отчёт (если нужно)
 BLOCK: int = 24
 
 
-# ===== Базовые карты: ELA / Noise / Text =====================================
+# ===== ELA / Noise / Text =====================================================
 
 def _ela_single(pil_img: Image.Image, q: int) -> np.ndarray:
-    """Один прогон ELA на заданном JPEG-качестве -> float32 HxWx3 (0..255 нормировано)."""
+    """Один прогон ELA на JPEG-качестве q -> float32 HxWx3 (0..255)."""
     buf = io.BytesIO()
     pil_img.save(buf, 'JPEG', quality=q, optimize=True)
     buf.seek(0)
     comp = Image.open(buf).convert('RGB')
     ela = ImageChops.difference(pil_img.convert('RGB'), comp)
-    # автоусиление яркости
+
     extrema = ela.getextrema()
     maxv = 0
     for e in extrema:
@@ -62,9 +62,9 @@ def _ela_single(pil_img: Image.Image, q: int) -> np.ndarray:
 def ela_ensemble_gray(pil_img: Image.Image) -> np.ndarray:
     """Ансамблевый ELA -> grayscale uint8 (0..255)."""
     pil_img = pil_img.convert('RGB')
-    arrs = [_ela_single(pil_img, q) for q in ELA_QUALS]  # HxWx3
+    arrs = [_ela_single(pil_img, q) for q in ELA_QUALS]   # HxWx3
     ela = np.mean(arrs, axis=0)
-    # сворачиваем L2 по каналам -> 0..1
+    # L2 по каналам -> [0..1]
     ela_gray = np.sqrt(np.sum(ela ** 2, axis=2))
     ela_gray = (ela_gray - ela_gray.min()) / (ela_gray.ptp() + 1e-6)
     return (ela_gray * 255.0 + 0.5).astype(np.uint8)
@@ -91,7 +91,7 @@ def text_mask(pil_img: Image.Image) -> np.ndarray:
                                 cv2.THRESH_BINARY_INV, 21, 7)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     txt = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    # 🔧 FIX: правильный вызов dilate — первым аргументом идёт изображение, а не ядро
+    # FIX: cv2.dilate(image, kernel, ...)
     txt = cv2.dilate(txt, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
     return (txt > 0).astype(np.float32)
 
@@ -104,21 +104,25 @@ def fused_score(pil_img: Image.Image) -> np.ndarray:
     # ELA -> [0..1]
     ela_u8 = ela_ensemble_gray(pil_img)
     ela = ela_u8.astype(np.float32) / 255.0
+
     # Noise -> [0..1]
     g = np.asarray(pil_img.convert('L')).astype(np.float32)
     g = (g - g.min()) / (g.ptp() + 1e-6)
     noise = noise_map_from_gray((g * 255).astype(np.uint8), k=VAR_KERNEL)
+
     # fuse
     score = SCORE_W_ELA * ela + SCORE_W_NOISE * noise
+
     # suppress printed text
     tmask = text_mask(pil_img)
     score = score * (1.0 - TEXT_SUPPRESS * tmask)
+
     # normalize
     score = (score - score.min()) / (score.ptp() + 1e-6)
     return score.astype(np.float32)
 
 
-# ===== Сегментация и регионы ==================================================
+# ===== Сегментация ============================================================
 
 def regions_from_score(score: np.ndarray,
                        percentile: int = DEFAULT_PERCENTILE,
@@ -133,12 +137,12 @@ def regions_from_score(score: np.ndarray,
     thr = float(np.percentile(score, percentile))
     mask = (score >= thr).astype(np.uint8) * 255
 
-    # морфологическая очистка
+    # морфология
     kernel = np.ones((morph, morph), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, 1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, 1)
 
-    # отсев по площади
+    # фильтр по площади
     min_area = int(min_area_ratio * H * W)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -164,9 +168,7 @@ def make_ela_visual(ela_u8: np.ndarray,
                     gamma: float = ELA_GAMMA,
                     use_clahe: bool = ELA_USE_CLAHE,
                     colormap: int = COLORMAP) -> np.ndarray:
-    """
-    Яркий «кислотный» ELA-визуал: uint8 → BGR.
-    """
+    """Яркий «кислотный» ELA-визуал: uint8 → BGR."""
     x = ela_u8.copy()
     if use_clahe:
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -178,16 +180,11 @@ def make_ela_visual(ela_u8: np.ndarray,
 
 
 def _draw_arrows(bgr: np.ndarray, regions: List[Dict]) -> None:
-    """
-    Добавляем стрелки, «смотрящие» на зоны. Смещаем начало за пределы бокса,
-    чтобы взгляд сразу ловил подозрительное место.
-    """
+    """Добавляем стрелки, «смотрящие» на зоны."""
     H, W = bgr.shape[:2]
     for r in regions:
         x, y, w, h = r["x"], r["y"], r["w"], r["h"]
         cx, cy = x + w // 2, y + h // 2
-
-        # выбираем направление стрелки в зависимости от квадранта
         start = (max(0, x - int(0.06 * W)), max(0, y - int(0.06 * H)))
         end = (cx, cy)
         cv2.arrowedLine(bgr, start, end, ARROW_COLOR, ARROW_THICK, tipLength=0.25)
@@ -198,31 +195,24 @@ def acid_overlay_on_original(pil_img: Image.Image,
                              regions: List[Dict],
                              alpha: float = OVERLAY_ALPHA,
                              colormap: int = COLORMAP) -> np.ndarray:
-    """
-    «Кислотная» подсветка на оригинале + рамки + стрелки.
-    Возвращает BGR.
-    """
+    """«Кислотная» теплокарта на оригинале + рамки + стрелки. Возвращает BGR."""
     src_bgr = cv2.cvtColor(np.asarray(pil_img.convert('RGB')), cv2.COLOR_RGB2BGR)
     hm = (score * 255).astype(np.uint8)
     hm_bgr = cv2.applyColorMap(hm, colormap)
 
-    # сам overlay
     over = cv2.addWeighted(src_bgr, 1.0, hm_bgr, alpha, 0)
 
-    # контуры по верхнему яркому слою (для чёткости)
     thr = int(np.percentile(hm, 97))
     _, mask_hi = cv2.threshold(hm, thr, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(mask_hi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(over, contours, -1, CONTOUR_COLOR, CONTOUR_THICK)
 
-    # рамки по регионам
     for idx, r in enumerate(regions, start=1):
         x, y, w, h = r["x"], r["y"], r["w"], r["h"]
         cv2.rectangle(over, (x, y), (x + w, y + h), BOX_COLOR, BOX_THICK)
         cv2.putText(over, f"#{idx}", (x, max(15, y - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, BOX_COLOR, 1, cv2.LINE_AA)
 
-    # стрелки
     _draw_arrows(over, regions)
     return over
 
@@ -243,31 +233,29 @@ def save_visuals_and_crops(pil_img: Image.Image,
     """
     Сохраняет:
       - ELA-визуал (кислотный)
-      - Overlay на оригинал (кислотная теплокарта + рамки + стрелки)
-      - Boxed (то же, оставлено для совместимости)
-      - «Лид»-кроп самой сильной зоны (если есть)
+      - Overlay на оригинал (теплокарта + рамки + стрелки)
+      - Boxed (копия overlay — для совместимости)
+      - «лид»-кроп самой сильной зоны
     Возвращает имена файлов: (ela_name, overlay_name, boxed_name, crops_list)
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ELA BGR
+    # ELA (BGR)
     if ela_u8 is None:
         ela_u8 = ela_ensemble_gray(pil_img)
     ela_bgr = make_ela_visual(ela_u8, gain=ela_gain, gamma=ela_gamma, use_clahe=use_clahe, colormap=colormap)
 
-    # Acid overlay (с рамками и стрелками)
+    # Overlay/Boxed (BGR)
     over_bgr = acid_overlay_on_original(pil_img, score, regions, alpha=OVERLAY_ALPHA, colormap=colormap)
-
-    # Для совместимости "boxed" = копия overlay (рамки уже нанесены)
     boxed_bgr = over_bgr.copy()
 
-    # save
-    ela_name = f"{stem}_ela.jpg"
-    ovl_name = f"{stem}_overlay.jpg"
+    # Save BGR напрямую — БЕЗ конверта в RGB!
+    ela_name   = f"{stem}_ela.jpg"
+    ovl_name   = f"{stem}_overlay.jpg"
     boxed_name = f"{stem}_boxed.jpg"
-    cv2.imwrite(str(out_dir / ela_name), cv2.cvtColor(ela_bgr, cv2.COLOR_BGR2RGB), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-    cv2.imwrite(str(out_dir / ovl_name), cv2.cvtColor(over_bgr, cv2.COLOR_BGR2RGB), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-    cv2.imwrite(str(out_dir / boxed_name), cv2.cvtColor(boxed_bgr, cv2.COLOR_BGR2RGB), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    cv2.imwrite(str(out_dir / ela_name),   ela_bgr,   [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    cv2.imwrite(str(out_dir / ovl_name),   over_bgr,  [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    cv2.imwrite(str(out_dir / boxed_name), boxed_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
     # «лид»-кроп
     crops = []
@@ -291,7 +279,7 @@ def save_visuals_and_crops(pil_img: Image.Image,
     return ela_name, ovl_name, boxed_name, crops
 
 
-# ===== Старый блочный отчёт (на всякий случай) ===============================
+# ===== Блочный отчёт (опционально) ===========================================
 
 def block_report(score: np.ndarray, block: int = BLOCK, top_k: int = 8) -> List[Dict]:
     H, W = score.shape
