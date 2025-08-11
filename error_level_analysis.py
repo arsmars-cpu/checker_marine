@@ -14,26 +14,29 @@ from PIL import Image, ImageChops, ImageEnhance
 
 ELA_QUALS: Tuple[int, ...] = (90, 95, 98)
 
-# Цветной ELA (как в «идеале»)
-COLORMAP = cv2.COLORMAP_MAGMA  # используется только если вдруг решишь включить LUT, по умолчанию не нужен
+# Цветной ELA (как в «идеале») — LUT не используем, карты цветные сами по себе
+COLORMAP = cv2.COLORMAP_MAGMA  # оставил для возможных экспериментов
 
-# Robust-нормализация (для второй картинки и метрики)
+# Robust-нормализация (для второй картинки)
 VIS_P_LO = 2
 VIS_P_HI = 98
 ROBUST_GAIN  = 1.6
 ROBUST_GAMMA = 0.9
 
-# Порог и рубрики вердикта по robust-карте (абсолютный, не перцентиль)
-HOT_THR = 0.80       # что ярче — считаем «горячим»
+# Порог и рубрики вердикта (считаем ТОЛЬКО белые зоны на classic)
 LOW_MAX = 2.0        # <2% — Low
 MID_MAX = 8.0        # 2–8% — Medium, иначе High
+
+# Белая зона = высокая яркость + низкая насыщенность (на classic карте)
+WHITE_V_THR = 0.82   # V >= 0.82 (~>= 210/255) — достаточно светло
+WHITE_S_THR = 0.28   # S <= 0.28 (~<= 72/255) — «почти белый/серый»
 
 # ===== Базовые шаги ELA =====
 
 def _ela_single(pil_img: Image.Image, q: int) -> np.ndarray:
     """
     JPEG(q) → разность с оригиналом, авто-растяжка яркости, возвращаем RGB float32 [0..255].
-    Это даёт то самое «цветное зерно» без LUT.
+    Даёт «цветное зерно» без LUT.
     """
     buf = io.BytesIO()
     pil_img.save(buf, "JPEG", quality=q, optimize=True)
@@ -65,7 +68,6 @@ def ela_ensemble_rgb(pil_img: Image.Image) -> np.ndarray:
     ela_rgb = np.clip(ela_rgb * (255.0 / mx), 0, 255)
     return ela_rgb.astype(np.uint8)
 
-
 # ===== Визуализации (оба — без colormap, чистый RGB шум) =====
 
 def make_ela_color_classic(ela_rgb_u8: np.ndarray) -> np.ndarray:
@@ -79,8 +81,8 @@ def make_ela_color_classic(ela_rgb_u8: np.ndarray) -> np.ndarray:
 
 def make_ela_color_robust(ela_rgb_u8: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Robust-вариант для плоских сканов: по каналам p2..p98 + gain/gamma.
-    Возвращает (rgb_u8, norm_gray 0..1), где norm_gray идёт в метрику.
+    Robust-вариант для «плоских» сканов: по каналам p2..p98 + gain/gamma.
+    Возвращает (rgb_u8, norm_gray 0..1) — norm_gray можно использовать для своих метрик.
     """
     x = ela_rgb_u8.astype(np.float32)
     y = np.empty_like(x)
@@ -96,10 +98,26 @@ def make_ela_color_robust(ela_rgb_u8: np.ndarray) -> Tuple[np.ndarray, np.ndarra
         y[:, :, c] = ch
     rgb_robust = (np.clip(y, 0, 1) * 255.0 + 0.5).astype(np.uint8)
 
-    # нормированная «яркость» для подсчёта горячих пикселей
-    g = np.sqrt(np.sum(y ** 2, axis=2)) / np.sqrt(3.0)  # 0..1
+    # нормированная «яркость» (0..1) — если понадобится
+    g = np.sqrt(np.sum(y ** 2, axis=2)) / np.sqrt(3.0)
     return rgb_robust, g
 
+# ===== Подсчёт «белых» артефактов на classic =====
+
+def hot_pct_from_white(classic_rgb_u8: np.ndarray,
+                       v_thr: float = WHITE_V_THR,
+                       s_thr: float = WHITE_S_THR) -> Tuple[float, np.ndarray]:
+    """
+    % «горячих» пикселей как белых зон: V >= v_thr и S <= s_thr.
+    Используем HSV от classic карты (RGB → HSV).
+    """
+    hsv = cv2.cvtColor(classic_rgb_u8, cv2.COLOR_RGB2HSV)
+    H, W = hsv.shape[:2]
+    S = hsv[:, :, 1].astype(np.float32) / 255.0
+    V = hsv[:, :, 2].astype(np.float32) / 255.0
+    mask = (V >= v_thr) & (S <= s_thr)
+    hot_pct = float(mask.mean() * 100.0) if H * W else 0.0
+    return hot_pct, mask.astype(np.uint8)
 
 # ===== Вердикт =====
 
@@ -110,13 +128,12 @@ def verdict_from_hot_pct(hot_pct: float) -> Tuple[str, str]:
         return "Medium (possible edits)", "yellow"
     return "High (likely edited)", "red"
 
-
 # ===== Раннер =====
 
 def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Dict:
     """
     Сохраняет оригинал + две цветные ELA-карты (classic и robust),
-    считает % «горячих» пикселей по robust и отдаёт статус.
+    считает % «белых» зон на classic и отдаёт статус.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -129,33 +146,35 @@ def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Di
     # 2) ELA RGB
     ela_rgb = ela_ensemble_rgb(pil_img)
 
-    # 2.1) classic
+    # 2.1) classic (твоя эталонная «цветная» карта)
     classic_rgb = make_ela_color_classic(ela_rgb)
     classic_name = f"{stem}_ela.jpg"
-    cv2.imwrite(str(out_dir / classic_name), cv2.cvtColor(classic_rgb, cv2.COLOR_RGB2BGR),
+    cv2.imwrite(str(out_dir / classic_name),
+                cv2.cvtColor(classic_rgb, cv2.COLOR_RGB2BGR),
                 [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
-    # 2.2) robust (+метрика)
-    robust_rgb, robust_norm = make_ela_color_robust(ela_rgb)
+    # 2.2) robust (усиленная карта для сравнения/переключателя)
+    robust_rgb, _robust_norm = make_ela_color_robust(ela_rgb)
     robust_name = f"{stem}_overlay.jpg"
-    cv2.imwrite(str(out_dir / robust_name), cv2.cvtColor(robust_rgb, cv2.COLOR_RGB2BGR),
+    cv2.imwrite(str(out_dir / robust_name),
+                cv2.cvtColor(robust_rgb, cv2.COLOR_RGB2BGR),
                 [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
-    # 3) Метрика / вердикт
-    hot_pct = float((robust_norm >= HOT_THR).mean() * 100.0)
+    # 3) Метрика/вердикт: считаем ТОЛЬКО белые зоны на classic
+    hot_pct, _ = hot_pct_from_white(classic_rgb)
     verdict, severity = verdict_from_hot_pct(hot_pct)
 
     to_web = lambda name: f"/static/results/{Path(name).name}"
     return {
         "label":    label,
         "original": to_web(orig_name),
-        "ela":      to_web(classic_name),   # слева — классический цветной ELA (как на твоём эталоне)
-        "overlay":  to_web(robust_name),    # по переключателю — усиленный вариант
+        "ela":      to_web(classic_name),   # слева — classic (с «цветным шумом»)
+        "overlay":  to_web(robust_name),    # кнопка «Toggle» покажет robust
         "boxed":    "",
         "verdict":  verdict,
         "severity": severity,
         "regions":  0,
         "crops":    [],
-        "summary":  f"{verdict} — hot pixels ≈ {hot_pct:.2f}% @ thr {int(HOT_THR*100)}%",
+        "summary":  f"{verdict} — white-hot ≈ {hot_pct:.2f}% (V≥{int(WHITE_V_THR*100)}%, S≤{int(WHITE_S_THR*100)}%).",
         "report":   ""
     }
