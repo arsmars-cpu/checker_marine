@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -29,21 +29,18 @@
     .row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}
     .hidden{display:none}
 
-    /* бейдж вердикта */
     .badge{display:inline-flex;align-items:center;font-weight:700;font-size:12px;border-radius:999px;padding:6px 10px;border:1px solid transparent}
     .sev-green{background:rgba(34,197,94,.12);color:var(--good);border-color:rgba(34,197,94,.35)}
     .sev-yellow{background:rgba(245,158,11,.12);color:var(--warn);border-color:rgba(245,158,11,.40)}
     .sev-red{background:rgba(239,68,68,.12);color:var(--bad);border-color:rgba(239,68,68,.40)}
 
-    /* кнопка-иконка скачать */
     .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:10px;background:var(--accent);border:none}
     .icon-btn svg{display:block}
 
-    /* легенда типов аномалий */
     .legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
     .legend .item{display:inline-flex;gap:8px;align-items:center;font-size:12px;color:#cbd5e1}
     .swatch{width:16px;height:16px;border-radius:4px;border:1px solid #263247}
-    .sw-add{background:linear-gradient(135deg,#3bf 0%,#ff0 50%,#f30 100%)}      /* TURBO-ish */
+    .sw-add{background:linear-gradient(135deg,#3bf 0%,#ff0 50%,#f30 100%)}
     .sw-erase{background:#ff00ff}
     .sw-seam{background:#ff8a00}
     .sw-cm{background:#2bffb5}
@@ -54,12 +51,12 @@
 <body>
   <h1>SeaDoc Checker</h1>
   <div class="sub">
-    Загрузите морские документы (JPG/PNG/PDF). Мы подсветим подозрительные зоны «кислотным» оверлеем и дадим краткий вердикт.
+    Upload maritime documents (JPG/PNG/PDF). We run ELA and highlight suspicious, “acid‑colored” regions, then give a short verdict.
     <div class="legend">
-      <div class="item"><span class="swatch sw-add"></span><span>Add/Replace (ELA⊕Noise)</span></div>
-      <div class="item"><span class="swatch sw-erase"></span><span>Erase/Замазывание (низкая ВЧ в тексте)</span></div>
-      <div class="item"><span class="swatch sw-seam"></span><span>Seam/Шов (граница вклейки)</span></div>
-      <div class="item"><span class="swatch sw-cm"></span><span>Copy–Move (дублирование фрагмента)</span></div>
+      <div class="item"><span class="swatch sw-add"></span><span>Add/Replace (ELA ⊕ noise)</span></div>
+      <div class="item"><span class="swatch sw-erase"></span><span>Erase (low HF in text)</span></div>
+      <div class="item"><span class="swatch sw-seam"></span><span>Seam (paste boundary)</span></div>
+      <div class="item"><span class="swatch sw-cm"></span><span>Copy–Move (duplicated fragment)</span></div>
     </div>
   </div>
 
@@ -67,7 +64,7 @@
     <form id="uploadForm" action="/analyze" method="post" enctype="multipart/form-data">
       <div class="row">
         <input id="fileInput" type="file" name="file" multiple required accept=".jpg,.jpeg,.png,.pdf">
-        <button class="btn" type="submit">Загрузить и анализировать</button>
+        <button class="btn" type="submit">Upload & Analyze</button>
       </div>
     </form>
     {% if message %}
@@ -82,7 +79,7 @@
         <div class="row" style="grid-template-columns:1fr auto;gap:8px;margin-bottom:8px">
           <div class="label">{{ r.label }}</div>
           {% if r.report %}
-            <a class="icon-btn" href="{{ r.report }}" download title="Скачать отчёт">
+            <a class="icon-btn" href="{{ r.report }}" download title="Download report">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M12 3v10m0 0l4-4m-4 4L8 9" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                 <path d="M4 14v4a2 2 0 002 2h12a2 2 0 002-2v-4" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -91,7 +88,6 @@
           {% endif %}
         </div>
 
-        <!-- Легенда внутри карточки (компактная) -->
         <div class="legend" style="margin:0 0 8px 0">
           <div class="item"><span class="swatch sw-add"></span><span>Add/Replace</span></div>
           <div class="item"><span class="swatch sw-erase"></span><span>Erase</span></div>
@@ -104,7 +100,7 @@
             <div class="row" style="grid-template-columns:auto auto;gap:8px;margin-bottom:8px">
               <button class="btn" type="button"
                 onclick="const card=this.closest('.panel'); card.querySelectorAll('.view-original,.view-boxed').forEach(el=>el.classList.toggle('hidden'));">
-                Показать: Оригинал ↔ Подсветка
+                Toggle: Original ↔ Highlight
               </button>
             </div>
           {% endif %}
@@ -123,7 +119,7 @@
 
         {% if r.crops and r.crops|length > 0 %}
           <div style="margin-top:8px">
-            <div class="label">Подозрительные регионы (thumbnails)</div>
+            <div class="label">Suspicious regions (thumbnails)</div>
             <div class="thumbs">
               {% for c in r.crops %}
                 <div class="imgbox" title="#{{ c.index }} score={{ c.score }}">
@@ -139,7 +135,7 @@
           {% set badge_class = 'sev-green' if sev=='green' else ('sev-yellow' if sev=='yellow' else 'sev-red') %}
           <span class="badge {{ badge_class }}">{{ r.verdict or 'All good' }}</span>
           {% if r.regions %}
-            <div style="margin-top:6px">Проверьте подсвеченные области — это кандидаты на редактирование/замазывание.</div>
+            <div style="margin-top:6px">Review the highlighted areas — candidates for edits/covering.</div>
           {% endif %}
         </div>
       </div>
@@ -148,17 +144,17 @@
   {% endif %}
 
   <div class="footer">
-    Подсказка: обращайте внимание на печати, даты и подписи — там чаще всего бывают правки.
+    Tip: stamps, dates, and signatures often carry edits. Bright clusters on ELA can indicate copy‑paste or retouch.
   </div>
 
   <script>
-    // фронтовая проверка размера (серверный лимит 25MB)
+    // Client-side size check (server limit 25 MB per file)
     document.getElementById('uploadForm').addEventListener('submit', function (e) {
       const files = document.getElementById('fileInput').files;
       for (let f of files) {
         if (f.size > 25 * 1024 * 1024) {
           e.preventDefault();
-          alert(`Файл ${f.name} слишком большой. Макс 25MB.`);
+          alert(`File ${f.name} is too large. Max 25 MB.`);
           return;
         }
       }
