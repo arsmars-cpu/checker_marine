@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Union
 import io
 
 import numpy as np
@@ -15,24 +15,24 @@ from PIL import Image, ImageChops, ImageEnhance
 # Ансамбль ELA по нескольким JPEG-качествам
 ELA_QUALS: Tuple[int, ...] = (90, 95, 98)
 
-# Сегментация
-VAR_KERNEL: int = 9             # окно локальной дисперсии
-MIN_AREA_RATIO: float = 0.002   # отсев мелких пятен (доля от площади)
-MASK_MORPH: int = 3             # морфология (ядро)
-SCORE_W_ELA: float = 0.65       # вес ELA в общей карте
-SCORE_W_NOISE: float = 0.35     # вес карты «непохожести» шума
-TEXT_SUPPRESS: float = 0.5      # подавление печатного текста в score
-DEFAULT_PERCENTILE: int = 95    # чувствительность (порог по перцентилю)
+# Сегментация (чуть мягче, чтобы уверенно ловить правки)
+VAR_KERNEL: int = 9               # окно локальной дисперсии
+MIN_AREA_RATIO: float = 0.0008    # было 0.002 → ловим более мелкие пятна (~0.08% кадра)
+MASK_MORPH: int = 5               # было 3 → лучше склеивает разрывы
+SCORE_W_ELA: float = 0.65         # вес ELA
+SCORE_W_NOISE: float = 0.35       # вес noise
+TEXT_SUPPRESS: float = 0.35       # было 0.5 → меньше глушим текст (часто правят текстом)
+DEFAULT_PERCENTILE: int = 93      # было 95 → мягче порог
 
 # Визуал
 COLORMAP: int = cv2.COLORMAP_TURBO
-ELA_GAIN: float = 1.5           # усиление ELA-визуала (1.2..1.8)
-ELA_GAMMA: float = 0.85         # гамма (ниже -> светлее)
-ELA_USE_CLAHE: bool = True      # локальный контраст для ELA
-OVERLAY_ALPHA: float = 0.58     # «кислотность» оверлея
-BOX_COLOR = (255, 255, 0)       # BGR: жёлтые рамки
-CONTOUR_COLOR = (0, 0, 255)     # BGR: красные контуры
-ARROW_COLOR = (255, 255, 255)   # BGR: белые стрелки
+ELA_GAIN: float = 1.5
+ELA_GAMMA: float = 0.85
+ELA_USE_CLAHE: bool = True
+OVERLAY_ALPHA: float = 0.58
+BOX_COLOR = (255, 255, 0)
+CONTOUR_COLOR = (0, 0, 255)
+ARROW_COLOR = (255, 255, 255)
 BOX_THICK: int = 2
 CONTOUR_THICK: int = 2
 ARROW_THICK: int = 2
@@ -124,23 +124,41 @@ def fused_score(pil_img: Image.Image) -> np.ndarray:
 
 # ===== Сегментация ============================================================
 
+def _build_mask_from_percentiles(score: np.ndarray,
+                                 percentiles: Union[int, List[int], Tuple[int, ...]],
+                                 morph: int) -> np.ndarray:
+    """Строим маску по одному или нескольким перцентилям и берём объединение."""
+    if isinstance(percentiles, (list, tuple)):
+        masks = []
+        for p in percentiles:
+            thr = float(np.percentile(score, p))
+            masks.append((score >= thr).astype(np.uint8) * 255)
+        mask = np.maximum.reduce(masks)
+    else:
+        thr = float(np.percentile(score, int(percentiles)))
+        mask = (score >= thr).astype(np.uint8) * 255
+
+    if morph > 0:
+        kernel = np.ones((morph, morph), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, 1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, 1)
+    return mask
+
+
 def regions_from_score(score: np.ndarray,
-                       percentile: int = DEFAULT_PERCENTILE,
+                       percentile: Union[int, List[int], Tuple[int, ...]] = (90, 93, 96),
                        morph: int = MASK_MORPH,
                        min_area_ratio: float = MIN_AREA_RATIO,
                        pad: int = 8,
                        top_k: int = 6) -> Tuple[np.ndarray, List[Dict]]:
     """
     score (0..1) → бинарная маска (uint8 0/255) + топ-регионы [{x,y,w,h,score}].
+
+    По умолчанию используем несколько перцентилей (90/93/96) и берём объединение —
+    это помогает ловить и «жирные» вмешательства, и тонкие правки.
     """
     H, W = score.shape
-    thr = float(np.percentile(score, percentile))
-    mask = (score >= thr).astype(np.uint8) * 255
-
-    # морфология
-    kernel = np.ones((morph, morph), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, 1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, 1)
+    mask = _build_mask_from_percentiles(score, percentile, morph)
 
     # фильтр по площади
     min_area = int(min_area_ratio * H * W)
@@ -249,7 +267,7 @@ def save_visuals_and_crops(pil_img: Image.Image,
     over_bgr = acid_overlay_on_original(pil_img, score, regions, alpha=OVERLAY_ALPHA, colormap=colormap)
     boxed_bgr = over_bgr.copy()
 
-    # Save BGR напрямую — БЕЗ конверта в RGB!
+    # Сохраняем BGR напрямую (без конверта в RGB)
     ela_name   = f"{stem}_ela.jpg"
     ovl_name   = f"{stem}_overlay.jpg"
     boxed_name = f"{stem}_boxed.jpg"
