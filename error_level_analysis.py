@@ -17,16 +17,16 @@ ELA_QUALS: Tuple[int, ...] = (90, 95, 98)
 
 # Сегментация (усилили чувствительность)
 VAR_KERNEL: int = 9               # окно локальной дисперсии
-MIN_AREA_RATIO: float = 0.0002    # ловим мельче (~0.02% кадра)
-MASK_MORPH: int = 5               # чуть больше склейка мелких разрывов
+MIN_AREA_RATIO: float = 0.00005   # ловим мельчайшие зоны (~0.005% кадра)
+MASK_MORPH: int = 5               # склеиваем разрывы построчного текста
 SCORE_W_ELA: float = 0.65
 SCORE_W_NOISE: float = 0.35
-TEXT_SUPPRESS: float = 0.15       # меньше глушим текст (часто правят текст)
-DEFAULT_PERCENTILE: int = 90      # мягче порог
+TEXT_SUPPRESS: float = 0.15       # почти не глушим текст
+DEFAULT_PERCENTILE: int = 90      # базовый порог мягче
 
 # Визуал
 COLORMAP: int = cv2.COLORMAP_TURBO
-ELA_GAIN: float = 1.7             # ELA ярче
+ELA_GAIN: float = 1.7
 ELA_GAMMA: float = 0.85
 ELA_USE_CLAHE: bool = True
 OVERLAY_ALPHA: float = 0.58
@@ -44,7 +44,6 @@ BLOCK: int = 24
 # ===== ELA / Noise / Text =====================================================
 
 def _ela_single(pil_img: Image.Image, q: int) -> np.ndarray:
-    """Один прогон ELA на JPEG-качестве q -> float32 HxWx3 (0..255)."""
     buf = io.BytesIO()
     pil_img.save(buf, 'JPEG', quality=q, optimize=True)
     buf.seek(0)
@@ -60,11 +59,9 @@ def _ela_single(pil_img: Image.Image, q: int) -> np.ndarray:
 
 
 def ela_ensemble_gray(pil_img: Image.Image) -> np.ndarray:
-    """Ансамблевый ELA -> grayscale uint8 (0..255)."""
     pil_img = pil_img.convert('RGB')
-    arrs = [_ela_single(pil_img, q) for q in ELA_QUALS]   # HxWx3
+    arrs = [_ela_single(pil_img, q) for q in ELA_QUALS]
     ela = np.mean(arrs, axis=0)
-    # L2 по каналам -> [0..1]
     ela_gray = np.sqrt(np.sum(ela ** 2, axis=2))
     ela_gray = (ela_gray - ela_gray.min()) / (ela_gray.ptp() + 1e-6)
     return (ela_gray * 255.0 + 0.5).astype(np.uint8)
@@ -78,14 +75,12 @@ def _local_variance(gray: np.ndarray, k: int = VAR_KERNEL) -> np.ndarray:
 
 
 def noise_map_from_gray(gray_u8: np.ndarray, k: int = VAR_KERNEL) -> np.ndarray:
-    """Карта «непохожести» локального шума (0..1): 1 — подозрительно ровно/иначе."""
     var = _local_variance(gray_u8, k)
     var = (var - var.min()) / (var.ptp() + 1e-6)
     return 1.0 - var
 
 
 def text_mask(pil_img: Image.Image) -> np.ndarray:
-    """Маска печатного текста (0/1 float32)."""
     g = np.asarray(pil_img.convert('L'))
     thr = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                 cv2.THRESH_BINARY_INV, 21, 7)
@@ -96,37 +91,25 @@ def text_mask(pil_img: Image.Image) -> np.ndarray:
 
 
 def fused_score(pil_img: Image.Image) -> np.ndarray:
-    """
-    Итоговая карта 0..1: ELA ⊕ Noise с приглушением печатного текста.
-    0 — обычная область, 1 — «аномально шумно/непохоже».
-    """
-    # ELA -> [0..1]
+    """0..1: ELA ⊕ Noise с приглушением печатного текста."""
     ela_u8 = ela_ensemble_gray(pil_img)
     ela = ela_u8.astype(np.float32) / 255.0
 
-    # Noise -> [0..1]
     g = np.asarray(pil_img.convert('L')).astype(np.float32)
     g = (g - g.min()) / (g.ptp() + 1e-6)
     noise = noise_map_from_gray((g * 255).astype(np.uint8), k=VAR_KERNEL)
 
-    # fuse
     score = SCORE_W_ELA * ela + SCORE_W_NOISE * noise
-
-    # suppress printed text
-    tmask = text_mask(pil_img)
-    score = score * (1.0 - TEXT_SUPPRESS * tmask)
-
-    # normalize
+    score = score * (1.0 - TEXT_SUPPRESS * text_mask(pil_img))
     score = (score - score.min()) / (score.ptp() + 1e-6)
     return score.astype(np.float32)
 
 
-# ===== Сегментация + фолбэки =================================================
+# ===== Сегментация + локальный z‑score и фолбэки =============================
 
 def _build_mask_from_percentiles(score: np.ndarray,
                                  percentiles: Union[int, List[int], Tuple[int, ...]],
                                  morph: int) -> np.ndarray:
-    """Строим маску по одному или нескольким перцентилям и берём объединение."""
     if isinstance(percentiles, (list, tuple)):
         masks = []
         for p in percentiles:
@@ -144,43 +127,50 @@ def _build_mask_from_percentiles(score: np.ndarray,
     return mask
 
 
+def _local_zscore(score: np.ndarray, sigma: float = 6.0) -> np.ndarray:
+    """Насколько точка «горяча» относительно своего окружения."""
+    mu  = cv2.GaussianBlur(score, (0, 0), sigma)
+    mu2 = cv2.GaussianBlur(score * score, (0, 0), sigma)
+    var = np.maximum(mu2 - mu * mu, 1e-6)
+    z = (score - mu) / np.sqrt(var)
+    z = np.clip(z, 0, None)  # отрицательное неинтересно
+    z = (z - z.min()) / (z.ptp() + 1e-6)
+    return z.astype(np.float32)
+
+
 def _hot_windows(score: np.ndarray, k: int = 3, win: int = 48) -> List[Dict]:
-    """Safety‑net: берём k самых «горячих» окон win×win без сильного перекрытия."""
     H, W = score.shape
     heat = cv2.GaussianBlur(score, (0, 0), 2)
     regs: List[Dict] = []
     taken = np.zeros_like(score, dtype=np.uint8)
-
     for _ in range(k):
-        yx = np.unravel_index(np.argmax(heat * (1 - taken)), heat.shape)
-        y, x = int(yx[0]), int(yx[1])
-        x0 = max(0, x - win // 2); y0 = max(0, y - win // 2)
-        x1 = min(W, x0 + win);     y1 = min(H, y0 + win)
+        y, x = np.unravel_index(np.argmax(heat * (1 - taken)), heat.shape)
+        x0 = max(0, int(x - win // 2)); y0 = max(0, int(y - win // 2))
+        x1 = min(W, x0 + win);         y1 = min(H, y0 + win)
         roi = score[y0:y1, x0:x1]
         if roi.size == 0 or float(roi.max()) < 0.2:
             break
-        regs.append({"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0,
-                     "score": float(roi.mean())})
+        regs.append({"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0, "score": float(roi.mean())})
         taken[y0:y1, x0:x1] = 1
     return regs
 
 
 def regions_from_score(score: np.ndarray,
-                       percentile: Union[int, List[int], Tuple[int, ...]] = (85, 90, 95, 97),
+                       percentile: Union[int, List[int], Tuple[int, ...]] = (82, 88, 94, 97),
                        morph: int = MASK_MORPH,
                        min_area_ratio: float = MIN_AREA_RATIO,
-                       pad: int = 8,
+                       pad: int = 12,
                        top_k: int = 6) -> Tuple[np.ndarray, List[Dict]]:
     """
-    score (0..1) → бинарная маска (uint8 0/255) + топ-регионы [{x,y,w,h,score}].
-
-    Используем объединение нескольких перцентилей — ловим и «жирные» вмешательства,
-    и тонкие правки. Если пусто — включаем два фолбэка.
+    score (0..1) → бинарная маска (uint8 0/255) + регионы [{x,y,w,h,score}].
+    Объединяем «абсолютную» карту и локальный z‑score для устойчивости.
     """
-    H, W = score.shape
-    mask = _build_mask_from_percentiles(score, percentile, morph)
+    # усиливаем локальные «аномалии» относительно окружения
+    used = np.clip(0.6 * score + 0.4 * _local_zscore(score), 0, 1)
 
-    # контуры + отсев по площади
+    H, W = used.shape
+    mask = _build_mask_from_percentiles(used, percentile, morph)
+
     min_area = int(min_area_ratio * H * W)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -191,29 +181,30 @@ def regions_from_score(score: np.ndarray,
             continue
         x0 = max(0, x - pad); y0 = max(0, y - pad)
         x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
-        roi = score[y0:y1, x0:x1]
+        roi = used[y0:y1, x0:x1]
         sc = float(np.mean(roi)) if roi.size else 0.0
         regs.append({"x": int(x0), "y": int(y0), "w": int(x1 - x0), "h": int(y1 - y0), "score": round(sc, 4)})
 
     regs.sort(key=lambda r: r["score"], reverse=True)
     regs = regs[:top_k]
 
-    # Fallback 1: горячие блоки помельче
+    # Фолбэки на случай пустоты
     if not regs:
+        # 1) горячие блоки помельче
         block = 16
         boxes = []
         for by in range(0, H, block):
             for bx in range(0, W, block):
-                s = score[by:min(by+block,H), bx:min(bx+block,W)]
+                s = used[by:min(by+block, H), bx:min(bx+block, W)]
                 if s.size == 0:
                     continue
                 boxes.append((float(s.mean()), bx, by, min(block, W-bx), min(block, H-by)))
         boxes.sort(reverse=True, key=lambda t: t[0])
-        regs = [{"x": x, "y": y, "w": w, "h": h, "score": round(v,4)} for v,x,y,w,h in boxes[:min(3, top_k)]]
+        regs = [{"x": x, "y": y, "w": w, "h": h, "score": round(v, 4)} for v, x, y, w, h in boxes[:min(3, top_k)]]
 
-    # Fallback 2: окна вокруг глобальных максимумов
     if not regs:
-        regs = _hot_windows(score, k=min(3, top_k), win=48)
+        # 2) окна вокруг глобальных максимумов
+        regs = _hot_windows(used, k=min(3, top_k), win=48)
 
     return mask, regs
 
@@ -225,7 +216,6 @@ def make_ela_visual(ela_u8: np.ndarray,
                     gamma: float = ELA_GAMMA,
                     use_clahe: bool = ELA_USE_CLAHE,
                     colormap: int = COLORMAP) -> np.ndarray:
-    """Яркий «кислотный» ELA-визуал: uint8 → BGR."""
     x = ela_u8.copy()
     if use_clahe:
         clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -237,7 +227,6 @@ def make_ela_visual(ela_u8: np.ndarray,
 
 
 def _draw_arrows(bgr: np.ndarray, regions: List[Dict]) -> None:
-    """Добавляем стрелки, «смотрящие» на зоны."""
     H, W = bgr.shape[:2]
     for r in regions:
         x, y, w, h = r["x"], r["y"], r["w"], r["h"]
@@ -252,7 +241,6 @@ def acid_overlay_on_original(pil_img: Image.Image,
                              regions: List[Dict],
                              alpha: float = OVERLAY_ALPHA,
                              colormap: int = COLORMAP) -> np.ndarray:
-    """«Кислотная» теплокарта на оригинале + рамки + стрелки. Возвращает BGR."""
     src_bgr = cv2.cvtColor(np.asarray(pil_img.convert('RGB')), cv2.COLOR_RGB2BGR)
     hm = (score * 255).astype(np.uint8)
     hm_bgr = cv2.applyColorMap(hm, colormap)
@@ -287,14 +275,6 @@ def save_visuals_and_crops(pil_img: Image.Image,
                            ela_gamma: float = ELA_GAMMA,
                            use_clahe: bool = ELA_USE_CLAHE,
                            colormap: int = COLORMAP) -> Tuple[str, str, str, list]:
-    """
-    Сохраняет:
-      - ELA-визуал (кислотный)
-      - Overlay на оригинал (теплокарта + рамки + стрелки)
-      - Boxed (копия overlay — для совместимости)
-      - «лид»-кроп самой сильной зоны
-    Возвращает имена файлов: (ela_name, overlay_name, boxed_name, crops_list)
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if ela_u8 is None:
