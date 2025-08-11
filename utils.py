@@ -1,4 +1,3 @@
-# utils.py
 import io
 import uuid
 from pathlib import Path
@@ -7,17 +6,18 @@ import numpy as np
 import cv2
 from PIL import Image, ImageChops, ImageEnhance
 
-# ---- пути (те же, что и в app.py) ----
+# ---- пути ----
 BASE_DIR = Path(__file__).parent
 RESULTS_DIR = BASE_DIR / "static" / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---- настройки ELA/маски ----
+# ---- настройки ----
 JPEG_QUALITIES = (90, 95, 98)   # ансамбль пересохранений
 VAR_KERNEL = 9                  # окно дисперсии
-MIN_AREA_RATIO = 0.002          # минимальная площадь пятна (0.2% кадра)
+MIN_AREA_RATIO = 0.002          # минимальная площадь пятна (~0.2%)
 MASK_MORPH = 3                  # морфология очистки
 PDF_DPI = 300                   # DPI для рендера PDF (iter_pdf_pages)
+
 
 # ---------- базовые утилиты ----------
 def _local_variance(gray: np.ndarray, k: int = VAR_KERNEL) -> np.ndarray:
@@ -26,6 +26,7 @@ def _local_variance(gray: np.ndarray, k: int = VAR_KERNEL) -> np.ndarray:
     sqmean = cv2.blur(gray_f * gray_f, (k, k))
     var = np.clip(sqmean - mean * mean, 0, None)
     return var
+
 
 def _ela_map(pil_img: Image.Image) -> np.ndarray:
     """Ансамблевый ELA: максимум разностей по нескольким JPEG‑качествам."""
@@ -49,14 +50,15 @@ def _ela_map(pil_img: Image.Image) -> np.ndarray:
     ela = np.maximum.reduce(maps)
     return ela.astype(np.uint8)
 
+
 def _mask_flat_regions(ela_gray: np.ndarray) -> np.ndarray:
     """
-    Маска «подозрительных» зон без учёта семантики:
-    ищем ровные (низкая вариативность) но яркие области шумовой карты.
+    Маска «подозрительных» зон без семантики:
+    ищем ровные (низкая вариативность) участки шумовой карты.
     """
     ela_blur = cv2.GaussianBlur(ela_gray, (3, 3), 0)
 
-    # локальная дисперсия: пластичные пятна → низкая дисперсия
+    # локальная дисперсия
     var = _local_variance(ela_blur, VAR_KERNEL)
     var = cv2.normalize(var, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
@@ -86,6 +88,7 @@ def _mask_flat_regions(ela_gray: np.ndarray) -> np.ndarray:
             cv2.drawContours(out, [c], -1, 255, thickness=-1)
     return out
 
+
 def _overlay_mask(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Полупрозрачная заливка маски + контур."""
     overlay = rgb.copy()
@@ -97,12 +100,14 @@ def _overlay_mask(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     cv2.drawContours(overlay, contours, -1, (0, 0, 255), thickness=2)
     return overlay
 
+
 def _summarize(mask: np.ndarray) -> tuple[float, int]:
     total = mask.size
     pos = int((mask > 0).sum())
     pct = 100.0 * pos / max(1, total)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return round(pct, 2), len(contours)
+
 
 def _verdict(p: float) -> str:
     if p >= 10.0:
@@ -111,15 +116,16 @@ def _verdict(p: float) -> str:
         return "Medium (possible edits)"
     return "Low (no clear edits)"
 
+
 # ---------- публичные функции ----------
 def process_pil_image(pil: Image.Image, label: str, batch: str) -> dict:
     """
-    1) строим полноцветную ELA‑карту (как на твоих примерах),
-    2) выделяем ровные «пластичные» пятна (маска),
-    3) считаем % площади и число регионов,
-    4) сохраняем оригинал, ELA‑карту и overlay.
-    Возвращаем словарь, который уже понимает index.html.
+    Строим ELA‑карту, выделяем «пластичные» пятна, считаем % и регионы,
+    сохраняем оригинал/ELA/overlay и отдаём словарь для UI.
     """
+    if pil is None:
+        raise ValueError("Empty image")
+
     pil = pil.convert("RGB")
     src = np.array(pil)
 
@@ -141,26 +147,24 @@ def process_pil_image(pil: Image.Image, label: str, batch: str) -> dict:
     Image.fromarray(cv2.cvtColor(ela_vis, cv2.COLOR_BGR2RGB)).save(str(ela_path), "JPEG", quality=95)
     Image.fromarray(cv2.cvtColor(ovl, cv2.COLOR_BGR2RGB)).save(str(ovl_path), "JPEG", quality=95)
 
-    summary = (
-        f"{verdict} — suspicious area ≈ {pct:.2f}%"
-        f" across {regions} region(s)."
-    )
+    summary = f"{verdict} — suspicious area ≈ {pct:.2f}% across {regions} region(s)."
 
     return {
         "label": label,
-        "original": str(src_path).replace("\\", "/"),
-        "ela": str(ela_path).replace("\\", "/"),
-        "overlay": str(ovl_path).replace("\\", "/"),
-        "boxed": "",          # зарезервировано (не используем сейчас)
+        "original": f"/static/results/{src_path.name}",
+        "ela":      f"/static/results/{ela_path.name}",
+        "overlay":  f"/static/results/{ovl_path.name}",
+        "boxed": "",
         "verdict": verdict,
         "regions": regions,
-        "crops": [],          # зарезервировано
+        "crops": [],
         "summary": summary
     }
 
+
 def iter_pdf_pages(pdf_path: Path, dpi: int = PDF_DPI):
-    """Генератор страниц PDF как PIL.Image (1‑индексация)."""
-    import fitz  # локальный импорт, чтобы не мешать non‑PDF потокам
+    """Генератор: страницы PDF как PIL.Image (1‑индексация)."""
+    import fitz
     with fitz.open(str(pdf_path)) as doc:
         for i in range(len(doc)):
             pix = doc[i].get_pixmap(dpi=dpi, alpha=False)
