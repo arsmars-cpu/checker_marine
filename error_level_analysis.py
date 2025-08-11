@@ -14,125 +14,148 @@ from PIL import Image, ImageChops, ImageEnhance
 
 ELA_QUALS: Tuple[int, ...] = (90, 95, 98)
 
-# Визуал (классика и «усиленная»)
-COLORMAP = cv2.COLORMAP_MAGMA       # тот самый фиолетово-оранжевый LUT
+# Цветной ELA (как в «идеале»)
+COLORMAP = cv2.COLORMAP_MAGMA  # используется только если вдруг решишь включить LUT, по умолчанию не нужен
 
-# Классика — делаем темнее, как на твоём эталоне
-CLASSIC_DARKEN = 0.78               # 0.75..0.85 — подстрой при желании
-
-# robust: p2..p98 растяжка + лёгкий gain/gamma
+# Robust-нормализация (для второй картинки и метрики)
 VIS_P_LO = 2
 VIS_P_HI = 98
-ROBUST_GAIN  = 1.15
-ROBUST_GAMMA = 1.00
+ROBUST_GAIN  = 1.6
+ROBUST_GAMMA = 0.9
 
-# Вердикт по КЛАССИКЕ: адаптивный порог p99.x
-P_HOT   = 99.4                      # повысь до 99.5 если ещё «жарит»
-LOW_MAX = 2.0                       # <2% горячих пикселей — Low
-MID_MAX = 8.0                       # 2–8% — Medium, иначе High
+# Порог и рубрики вердикта по robust-карте (абсолютный, не перцентиль)
+HOT_THR = 0.80       # что ярче — считаем «горячим»
+LOW_MAX = 2.0        # <2% — Low
+MID_MAX = 8.0        # 2–8% — Medium, иначе High
 
 # ===== Базовые шаги ELA =====
 
 def _ela_single(pil_img: Image.Image, q: int) -> np.ndarray:
+    """
+    JPEG(q) → разность с оригиналом, авто-растяжка яркости, возвращаем RGB float32 [0..255].
+    Это даёт то самое «цветное зерно» без LUT.
+    """
     buf = io.BytesIO()
-    pil_img.save(buf, 'JPEG', quality=q, optimize=True)
+    pil_img.save(buf, "JPEG", quality=q, optimize=True)
     buf.seek(0)
-    comp = Image.open(buf).convert('RGB')
-    ela = ImageChops.difference(pil_img.convert('RGB'), comp)
+    comp = Image.open(buf).convert("RGB")
+    ela = ImageChops.difference(pil_img.convert("RGB"), comp)
 
-    # автонормализация, как раньше
+    # авто-нормализация как в классике
     extrema = ela.getextrema()
     maxv = 0
     for e in extrema:
         maxv = max(maxv, e[1] if isinstance(e, tuple) else e)
     ela = ImageEnhance.Brightness(ela).enhance(255.0 / max(1, maxv))
 
-    return np.asarray(ela).astype(np.float32)
+    return np.asarray(ela).astype(np.float32)  # (H,W,3) float32 0..255
 
-def ela_ensemble_gray(pil_img: Image.Image) -> np.ndarray:
-    pil_img = pil_img.convert('RGB')
+
+def ela_ensemble_rgb(pil_img: Image.Image) -> np.ndarray:
+    """
+    Ансамбль по качествам JPEG → среднее RGB, без LUT.
+    """
+    pil_img = pil_img.convert("RGB")
     arrs = [_ela_single(pil_img, q) for q in ELA_QUALS]
-    ela = np.mean(arrs, axis=0)                   # (H,W,3) float32
-    ela_gray = np.sqrt(np.sum(ela ** 2, axis=2))  # L2 по каналам
-    ela_gray = (ela_gray - ela_gray.min()) / (np.ptp(ela_gray) + 1e-6)
-    return (ela_gray * 255.0 + 0.5).astype(np.uint8)  # (H,W) uint8
+    ela_rgb = np.mean(arrs, axis=0)  # (H,W,3) float32
+    # приводим в 0..255
+    mx = float(np.max(ela_rgb)) if ela_rgb.size else 1.0
+    if mx <= 0:
+        mx = 1.0
+    ela_rgb = np.clip(ela_rgb * (255.0 / mx), 0, 255)
+    return ela_rgb.astype(np.uint8)
 
-# ===== Визуализации =====
 
-def make_ela_visual_classic(ela_u8: np.ndarray) -> np.ndarray:
-    """Тёмно-фиолетовая карта «как раньше»: чуть темнее + MAGMA LUT."""
-    x = np.clip(ela_u8.astype(np.float32) * CLASSIC_DARKEN, 0, 255).astype(np.uint8)
-    return cv2.applyColorMap(x, COLORMAP)
+# ===== Визуализации (оба — без colormap, чистый RGB шум) =====
 
-def make_ela_visual_robust(ela_u8: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def make_ela_color_classic(ela_rgb_u8: np.ndarray) -> np.ndarray:
     """
-    Robust-вариант: p2..p98 растяжка + лёгкий gain/gamma.
-    Возвращает (визуал BGR, нормированную карту 0..1 без цветовой палитры).
+    Классика: лёгкая гамма, чтобы зёрна читались на тёмном фоне.
     """
-    x = ela_u8.astype(np.float32)
-    p_lo = np.percentile(x, VIS_P_LO)
-    p_hi = np.percentile(x, VIS_P_HI)
-    if p_hi <= p_lo:  # защита на плоских случаях
-        p_lo, p_hi = float(x.min()), float(x.max())
-    x = (x - p_lo) / max(1e-6, (p_hi - p_lo))
-    x = np.clip(x, 0, 1)
-    x = np.clip(x * ROBUST_GAIN, 0, 1)
-    x = np.power(x, ROBUST_GAMMA)
-    x8 = (x * 255.0 + 0.5).astype(np.uint8)
-    vis = cv2.applyColorMap(x8, COLORMAP)
-    return vis, x  # BGR, float(0..1)
+    x = ela_rgb_u8.astype(np.float32) / 255.0
+    x = np.power(x, 0.9)
+    return (np.clip(x, 0, 1) * 255.0 + 0.5).astype(np.uint8)
 
-# ===== Вердикт (по классике, адаптивный порог) =====
 
-def _hot_percent_from_classic(ela_u8: np.ndarray) -> Tuple[float, float]:
-    thr = float(np.percentile(ela_u8, P_HOT))
-    hot_pct = float((ela_u8 >= thr).mean() * 100.0)
-    return hot_pct, thr / 255.0
+def make_ela_color_robust(ela_rgb_u8: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Robust-вариант для плоских сканов: по каналам p2..p98 + gain/gamma.
+    Возвращает (rgb_u8, norm_gray 0..1), где norm_gray идёт в метрику.
+    """
+    x = ela_rgb_u8.astype(np.float32)
+    y = np.empty_like(x)
+    for c in range(3):
+        ch = x[:, :, c]
+        p_lo = np.percentile(ch, VIS_P_LO)
+        p_hi = np.percentile(ch, VIS_P_HI)
+        if p_hi <= p_lo:
+            p_lo, p_hi = float(ch.min()), float(ch.max())
+        ch = (ch - p_lo) / max(1e-6, (p_hi - p_lo))
+        ch = np.clip(ch * ROBUST_GAIN, 0, 1)
+        ch = np.power(ch, ROBUST_GAMMA)
+        y[:, :, c] = ch
+    rgb_robust = (np.clip(y, 0, 1) * 255.0 + 0.5).astype(np.uint8)
 
-def _verdict_from_pct(hot_pct: float) -> Tuple[str, str]:
-    if hot_pct < LOW_MAX:  return "Low (no clear edits)", "green"
-    if hot_pct < MID_MAX:  return "Medium (possible edits)", "yellow"
+    # нормированная «яркость» для подсчёта горячих пикселей
+    g = np.sqrt(np.sum(y ** 2, axis=2)) / np.sqrt(3.0)  # 0..1
+    return rgb_robust, g
+
+
+# ===== Вердикт =====
+
+def verdict_from_hot_pct(hot_pct: float) -> Tuple[str, str]:
+    if hot_pct < LOW_MAX:
+        return "Low (no clear edits)", "green"
+    if hot_pct < MID_MAX:
+        return "Medium (possible edits)", "yellow"
     return "High (likely edited)", "red"
+
 
 # ===== Раннер =====
 
 def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Dict:
+    """
+    Сохраняет оригинал + две цветные ELA-карты (classic и robust),
+    считает % «горячих» пикселей по robust и отдаёт статус.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Сохраняем оригинал
     stem = f"{batch}_{uuid.uuid4().hex[:6]}"
+
+    # 1) Оригинал
     orig_name = f"{stem}_src.jpg"
     Image.fromarray(np.asarray(pil_img.convert("RGB"))).save(out_dir / orig_name, "JPEG", quality=95)
 
-    # 2) Строим ELA
-    ela_u8 = ela_ensemble_gray(pil_img)
+    # 2) ELA RGB
+    ela_rgb = ela_ensemble_rgb(pil_img)
 
-    # classic (твоё любимое)
-    classic_bgr = make_ela_visual_classic(ela_u8)
+    # 2.1) classic
+    classic_rgb = make_ela_color_classic(ela_rgb)
     classic_name = f"{stem}_ela.jpg"
-    cv2.imwrite(str(out_dir / classic_name), classic_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    cv2.imwrite(str(out_dir / classic_name), cv2.cvtColor(classic_rgb, cv2.COLOR_RGB2BGR),
+                [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
-    # robust (альтернативный взгляд)
-    robust_bgr, robust_norm = make_ela_visual_robust(ela_u8)
+    # 2.2) robust (+метрика)
+    robust_rgb, robust_norm = make_ela_color_robust(ela_rgb)
     robust_name = f"{stem}_overlay.jpg"
-    cv2.imwrite(str(out_dir / robust_name), robust_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    cv2.imwrite(str(out_dir / robust_name), cv2.cvtColor(robust_rgb, cv2.COLOR_RGB2BGR),
+                [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
-    # 3) Вердикт — по классике с адаптивным порогом p99.x
-    hot_pct, thr_norm = _hot_percent_from_classic(ela_u8)
-    verdict, severity = _verdict_from_pct(hot_pct)
+    # 3) Метрика / вердикт
+    hot_pct = float((robust_norm >= HOT_THR).mean() * 100.0)
+    verdict, severity = verdict_from_hot_pct(hot_pct)
 
-    # 4) Ответ для шаблона
     to_web = lambda name: f"/static/results/{Path(name).name}"
     return {
         "label":    label,
         "original": to_web(orig_name),
-        "ela":      to_web(classic_name),   # слева — «классика»
-        "overlay":  to_web(robust_name),    # по кнопке — robust
-        "boxed":    "",                     # без боксов/стрелок
+        "ela":      to_web(classic_name),   # слева — классический цветной ELA (как на твоём эталоне)
+        "overlay":  to_web(robust_name),    # по переключателю — усиленный вариант
+        "boxed":    "",
         "verdict":  verdict,
         "severity": severity,
         "regions":  0,
         "crops":    [],
-        "summary":  f"{verdict} — hot pixels ≈ {hot_pct:.2f}% (adaptive p{P_HOT}, thr≈{thr_norm:.2f}).",
+        "summary":  f"{verdict} — hot pixels ≈ {hot_pct:.2f}% @ thr {int(HOT_THR*100)}%",
         "report":   ""
     }
