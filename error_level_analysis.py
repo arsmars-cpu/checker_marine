@@ -15,14 +15,14 @@ from PIL import Image, ImageChops, ImageEnhance
 # Ансамбль ELA по нескольким JPEG-качествам
 ELA_QUALS: Tuple[int, ...] = (90, 95, 98)
 
-# Сегментация (чуть мягче, чтобы уверенно ловить правки)
+# Сегментация (усилили чувствительность)
 VAR_KERNEL: int = 9               # окно локальной дисперсии
-MIN_AREA_RATIO: float = 0.0008    # было 0.002 → ловим более мелкие пятна (~0.08% кадра)
-MASK_MORPH: int = 5               # было 3 → лучше склеивает разрывы
+MIN_AREA_RATIO: float = 0.0005    # было 0.0008/0.002 — ловим мельче (~0.05% кадра)
+MASK_MORPH: int = 3               # было 5 — меньше «склейки», тоньше детали
 SCORE_W_ELA: float = 0.65         # вес ELA
 SCORE_W_NOISE: float = 0.35       # вес noise
-TEXT_SUPPRESS: float = 0.35       # было 0.5 → меньше глушим текст (часто правят текстом)
-DEFAULT_PERCENTILE: int = 93      # было 95 → мягче порог
+TEXT_SUPPRESS: float = 0.25       # было 0.35/0.5 — меньше глушим текст (часто правят текст)
+DEFAULT_PERCENTILE: int = 92      # было 93/95 — мягче порог
 
 # Визуал
 COLORMAP: int = cv2.COLORMAP_TURBO
@@ -91,7 +91,7 @@ def text_mask(pil_img: Image.Image) -> np.ndarray:
                                 cv2.THRESH_BINARY_INV, 21, 7)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     txt = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    # FIX: cv2.dilate(image, kernel, ...)
+    # корректный вызов dilate
     txt = cv2.dilate(txt, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
     return (txt > 0).astype(np.float32)
 
@@ -146,16 +146,14 @@ def _build_mask_from_percentiles(score: np.ndarray,
 
 
 def regions_from_score(score: np.ndarray,
-                       percentile: Union[int, List[int], Tuple[int, ...]] = (90, 93, 96),
+                       percentile: Union[int, List[int], Tuple[int, ...]] = (88, 92, 96),
                        morph: int = MASK_MORPH,
                        min_area_ratio: float = MIN_AREA_RATIO,
                        pad: int = 8,
                        top_k: int = 6) -> Tuple[np.ndarray, List[Dict]]:
     """
     score (0..1) → бинарная маска (uint8 0/255) + топ-регионы [{x,y,w,h,score}].
-
-    По умолчанию используем несколько перцентилей (90/93/96) и берём объединение —
-    это помогает ловить и «жирные» вмешательства, и тонкие правки.
+    По умолчанию берём объединение нескольких перцентилей — ловим и тонкие, и «жирные» правки.
     """
     H, W = score.shape
     mask = _build_mask_from_percentiles(score, percentile, morph)
@@ -176,7 +174,17 @@ def regions_from_score(score: np.ndarray,
         regs.append({"x": int(x0), "y": int(y0), "w": int(x1 - x0), "h": int(y1 - y0), "score": round(sc, 4)})
 
     regs.sort(key=lambda r: r["score"], reverse=True)
-    return mask, regs[:top_k]
+    regs = regs[:top_k]
+
+    # Fallback: если ничего не нашли — всё равно подсветим самые «горячие» области
+    if not regs:
+        # грубая маска по верхнему перцентилю для визуала
+        mask = _build_mask_from_percentiles(score, 96, morph=0)
+        # возьмём несколько горячих блоков
+        hot = block_report(score, block=32, top_k=min(3, top_k))
+        regs = [{"x": h["x"], "y": h["y"], "w": h["w"], "h": h["h"], "score": h["score"]} for h in hot]
+
+    return mask, regs
 
 
 # ===== Визуал =================================================================
