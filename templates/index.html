@@ -51,12 +51,12 @@
 <body>
   <h1>SeaDoc Checker</h1>
   <div class="sub">
-    Upload maritime documents (JPG/PNG/PDF). We run ELA and highlight suspicious, “acid‑colored” regions, then give a short verdict.
+    Upload JPG/PNG/PDF documents. We run Error Level Analysis and overlay “acid” highlights for suspicious areas, then show a short verdict.
     <div class="legend">
       <div class="item"><span class="swatch sw-add"></span><span>Add/Replace (ELA ⊕ noise)</span></div>
-      <div class="item"><span class="swatch sw-erase"></span><span>Erase (low HF in text)</span></div>
+      <div class="item"><span class="swatch sw-erase"></span><span>Erase (low high‑freq in text)</span></div>
       <div class="item"><span class="swatch sw-seam"></span><span>Seam (paste boundary)</span></div>
-      <div class="item"><span class="swatch sw-cm"></span><span>Copy–Move (duplicated fragment)</span></div>
+      <div class="item"><span class="swatch sw-cm"></span><span>Copy–Move (duplicate)</span></div>
     </div>
   </div>
 
@@ -79,7 +79,7 @@
         <div class="row" style="grid-template-columns:1fr auto;gap:8px;margin-bottom:8px">
           <div class="label">{{ r.label }}</div>
           {% if r.report %}
-            <a class="icon-btn" href="{{ r.report }}" download title="Download report">
+            <a class="icon-btn" href="{{ r.report }}?v={{ loop.index }}" download title="Download report">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path d="M12 3v10m0 0l4-4m-4 4L8 9" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                 <path d="M4 14v4a2 2 0 002 2h12a2 2 0 002-2v-4" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -104,17 +104,17 @@
               </button>
             </div>
           {% endif %}
-          <div class="imgbox view-original"><img src="{{ r.original }}" alt="Original"></div>
+          <div class="imgbox view-original"><img loading="lazy" src="{{ r.original }}?v={{ loop.index }}" alt="Original page"></div>
         {% endif %}
 
         {% if r.ela %}
-          <div class="imgbox" style="margin-top:8px"><img src="{{ r.ela }}" alt="ELA"></div>
+          <div class="imgbox" style="margin-top:8px"><img loading="lazy" src="{{ r.ela }}?v={{ loop.index }}" alt="ELA heatmap"></div>
         {% endif %}
 
         {% if r.boxed %}
-          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img src="{{ r.boxed }}" alt="Highlighted"></div>
+          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img loading="lazy" src="{{ r.boxed }}?v={{ loop.index }}" alt="Highlighted regions"></div>
         {% elif r.overlay %}
-          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img src="{{ r.overlay }}" alt="Highlighted"></div>
+          <div class="imgbox view-boxed hidden" style="margin-top:8px"><img loading="lazy" src="{{ r.overlay }}?v={{ loop.index }}" alt="Highlighted regions"></div>
         {% endif %}
 
         {% if r.crops and r.crops|length > 0 %}
@@ -123,7 +123,7 @@
             <div class="thumbs">
               {% for c in r.crops %}
                 <div class="imgbox" title="#{{ c.index }} score={{ c.score }}">
-                  <img src="{{ c.url }}" alt="crop {{ c.index }}">
+                  <img loading="lazy" src="{{ c.url }}?v={{ loop.index }}-{{ c.index }}" alt="crop {{ c.index }}">
                 </div>
               {% endfor %}
             </div>
@@ -135,7 +135,7 @@
           {% set badge_class = 'sev-green' if sev=='green' else ('sev-yellow' if sev=='yellow' else 'sev-red') %}
           <span class="badge {{ badge_class }}">{{ r.verdict or 'All good' }}</span>
           {% if r.regions %}
-            <div style="margin-top:6px">Review the highlighted areas — candidates for edits/covering.</div>
+            <div style="margin-top:6px">Review the highlighted areas — likely edit candidates.</div>
           {% endif %}
         </div>
       </div>
@@ -144,7 +144,7 @@
   {% endif %}
 
   <div class="footer">
-    Tip: stamps, dates, and signatures often carry edits. Bright clusters on ELA can indicate copy‑paste or retouch.
+    Tip: stamps, dates, and signatures often carry edits. Bright ELA clusters can indicate copy‑paste or retouch.
   </div>
 
   <script>
