@@ -2,6 +2,7 @@ import os
 import io
 import uuid
 import time
+import traceback
 from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify
@@ -11,7 +12,7 @@ import fitz  # PyMuPDF
 
 # Новый пайплайн
 from error_level_analysis import run_image
-# Только генератор страниц PDF
+# Только генератор страниц PDF (если используешь)
 from utils import iter_pdf_pages
 
 # --------- конфиг ---------
@@ -62,6 +63,23 @@ def downscale_if_huge(pil_img: Image.Image, max_long_edge: int = MAX_LONG_EDGE) 
     return pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
 
+def make_error_result(label: str, uploaded_path_web: str | None, err: Exception) -> dict:
+    app.logger.error("Analysis error for %s: %s\n%s",
+                     label, err, traceback.format_exc())
+    return {
+        "label": label,
+        "original": uploaded_path_web,
+        "ela": "",
+        "overlay": "",
+        "boxed": "",
+        "verdict": "Analysis error",
+        "severity": "red",
+        "regions": 0,
+        "crops": [],
+        "summary": f"Error during analysis: {err}"
+    }
+
+
 # --------- роуты ---------
 @app.get("/")
 def index():
@@ -81,36 +99,32 @@ def analyze():
     for f in files:
         if not f or not allowed_file(f.filename):
             continue
+
         fname = secure_filename(f.filename)
         upath = UPLOAD_DIR / f"{batch}_{fname}"
         upath.parent.mkdir(parents=True, exist_ok=True)
         f.save(str(upath))
+        uploaded_web = f"/static/uploads/{batch}_{fname}"
 
         try:
             ext = Path(fname).suffix.lower()
             if ext == ".pdf":
+                # если используешь utils.iter_pdf_pages — он удобнее и быстрее
+                page_count = 0
                 for i, pimg in iter_pdf_pages(upath):
-                    pimg = downscale_if_huge(pimg)
+                    page_count += 1
+                    pimg = downscale_if_huge(pimg.convert("RGB"))
                     results.append(
-                        run_image(pimg.convert("RGB"), f"{fname} — page {i}", batch, RESULTS_DIR)
+                        run_image(pimg, f"{fname} — page {i}", batch, RESULTS_DIR)
                     )
+                if page_count == 0:
+                    raise RuntimeError("Empty PDF (no pages)")
             else:
                 pil = Image.open(str(upath)).convert("RGB")
                 pil = downscale_if_huge(pil)
                 results.append(run_image(pil, fname, batch, RESULTS_DIR))
         except Exception as e:
-            app.logger.exception(f"Analyze error: {fname} | {e}")
-            results.append({
-                "label": fname,
-                "original": f"/static/uploads/{batch}_{fname}",
-                "ela": "",
-                "overlay": "",
-                "boxed": "",
-                "verdict": "Analysis error",
-                "regions": 0,
-                "crops": [],
-                "summary": f"Error during analysis: {e}"
-            })
+            results.append(make_error_result(fname, uploaded_web, e))
 
     return render_template(
         "index.html",
@@ -136,9 +150,10 @@ def api_analyze():
         ext = Path(fname).suffix.lower()
         try:
             if ext == ".pdf":
-                data = io.BytesIO(f.read())
-                data.seek(0)
-                with fitz.open(stream=data.read(), filetype="pdf") as doc:
+                buf = io.BytesIO(f.read())
+                with fitz.open(stream=buf.getvalue(), filetype="pdf") as doc:
+                    if len(doc) == 0:
+                        raise RuntimeError("Empty PDF (no pages)")
                     for i in range(len(doc)):
                         pix = doc[i].get_pixmap(alpha=False)
                         pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -149,18 +164,7 @@ def api_analyze():
                 pil = downscale_if_huge(pil)
                 out.append(run_image(pil, fname, batch, RESULTS_DIR))
         except Exception as e:
-            app.logger.exception(f"/api analyze error: {fname} | {e}")
-            out.append({
-                "label": fname,
-                "original": None,
-                "ela": "",
-                "overlay": "",
-                "boxed": "",
-                "verdict": "Analysis error",
-                "regions": 0,
-                "crops": [],
-                "summary": f"PDF/image render error: {e}"
-            })
+            out.append(make_error_result(fname, None, e))
 
     return jsonify({"ok": True, "batch": batch, "results": out})
 
@@ -172,4 +176,5 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
+    # оставляю debug=False для продакшна; логи ошибок будут в stdout
     app.run(host="0.0.0.0", port=port, debug=False)
