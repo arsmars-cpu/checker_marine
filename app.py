@@ -9,9 +9,9 @@ from werkzeug.utils import secure_filename
 from PIL import Image, ImageFile
 import fitz  # PyMuPDF
 
-# новый пайплайн
+# Новый пайплайн
 from error_level_analysis import run_image
-# оставляем только итератор по PDF из utils (если он у тебя есть)
+# Только генератор страниц PDF
 from utils import iter_pdf_pages
 
 # --------- конфиг ---------
@@ -89,16 +89,15 @@ def analyze():
         try:
             ext = Path(fname).suffix.lower()
             if ext == ".pdf":
-                # если есть utils.iter_pdf_pages — используем его
                 for i, pimg in iter_pdf_pages(upath):
                     pimg = downscale_if_huge(pimg)
-                    res = run_image(pimg.convert("RGB"), f"{fname} — page {i}", batch, RESULTS_DIR)
-                    results.append(res)
+                    results.append(
+                        run_image(pimg.convert("RGB"), f"{fname} — page {i}", batch, RESULTS_DIR)
+                    )
             else:
                 pil = Image.open(str(upath)).convert("RGB")
                 pil = downscale_if_huge(pil)
-                res = run_image(pil, fname, batch, RESULTS_DIR)
-                results.append(res)
+                results.append(run_image(pil, fname, batch, RESULTS_DIR))
         except Exception as e:
             app.logger.exception(f"Analyze error: {fname} | {e}")
             results.append({
@@ -113,7 +112,11 @@ def analyze():
                 "summary": f"Error during analysis: {e}"
             })
 
-    return render_template("index.html", results=results, message=f"Batch {batch}: processed {len(results)} item(s).")
+    return render_template(
+        "index.html",
+        results=results,
+        message=f"Batch {batch}: processed {len(results)} item(s)."
+    )
 
 
 @app.post("/api/analyze")
@@ -125,6 +128,7 @@ def api_analyze():
 
     batch = uuid.uuid4().hex[:8]
     out = []
+
     for f in files:
         if not f or not allowed_file(f.filename):
             continue
@@ -132,7 +136,8 @@ def api_analyze():
         ext = Path(fname).suffix.lower()
         try:
             if ext == ".pdf":
-                data = io.BytesIO(f.read()); data.seek(0)
+                data = io.BytesIO(f.read())
+                data.seek(0)
                 with fitz.open(stream=data.read(), filetype="pdf") as doc:
                     for i in range(len(doc)):
                         pix = doc[i].get_pixmap(alpha=False)
