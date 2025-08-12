@@ -24,21 +24,21 @@ VIS_P_HI = 98
 ROBUST_GAIN  = 1.6
 ROBUST_GAMMA = 0.9
 
-# Порог и рубрики вердикта
-LOW_MAX = 1.0        # <1% — Low
-MID_MAX = 5.0        # 1–5% — Medium, иначе High
+# Порог и рубрики вердикта — чувствительнее
+LOW_MAX = 0.6        # <0.6% — Low
+MID_MAX = 3.5        # 0.6–3.5% — Medium, иначе High
 
-# Белая зона на classic = высокая яркость + низкая насыщенность (строже)
-WHITE_V_THR = 0.86   # V >= 0.86 (~>= 219/255)
-WHITE_S_THR = 0.32   # S <= 0.32 (~<= 82/255)
+# Белая зона на classic = высокая яркость + низкая насыщенность (мягче)
+WHITE_V_THR = 0.80   # V >= 0.80  (~>= 204/255)
+WHITE_S_THR = 0.45   # S <= 0.45  (~<= 115/255)
 
-# Яркая зона на robust (строже)
-ROBUST_HOT_THR = 0.86
+# Яркая зона на robust (мягче)
+ROBUST_HOT_THR = 0.80
 
 # Фильтры для подсчёта (борьба с шумом и бликами по краям)
-BORDER_INSET = 0.02           # срез 2% по периметру
-MIN_BLOB_AREA_RATIO = 0.0002  # ≥0.02% площади кадра
-MIN_BLOB_AREA_ABS   = 96      # и не меньше 96 пикселей
+BORDER_INSET = 0.01           # срез 1% по периметру
+MIN_BLOB_AREA_RATIO = 0.00005 # ≥0.005% площади кадра
+MIN_BLOB_AREA_ABS   = 64      # и не меньше 64 пикселей
 
 # DEBUG: сохранять ли диагностические маски
 DEBUG_SAVE_MASKS = True
@@ -191,7 +191,6 @@ def _overlay_mask_on_rgb(rgb: np.ndarray, mask: np.ndarray, color_bgr: Tuple[int
     color[:, :] = color_bgr
     m = (mask.astype(np.uint8) * 255)
     m3 = cv2.merge([m, m, m])
-    over = base.copy()
     over = np.where(m3 > 0, cv2.addWeighted(base, 1 - alpha, color, alpha, 0), base)
     return over
 
@@ -274,8 +273,8 @@ def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Di
     debug = {}
     if DEBUG_SAVE_MASKS:
         dbg_names = _save_debug_masks(pil_img, classic_rgb, fused_mask, white_mask, robust_mask, out_dir, stem)
-        to_web = lambda name: f"/static/results/{Path(name).name}"
-        debug = {k: to_web(v) for k, v in dbg_names.items()}
+        to_web_dbg = lambda name: f"/static/results/{Path(name).name}"
+        debug = {k: to_web_dbg(v) for k, v in dbg_names.items()}
 
     to_web = lambda name: f"/static/results/{Path(name).name}"
     return {
