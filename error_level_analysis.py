@@ -35,10 +35,14 @@ WHITE_S_THR = 0.45   # S <= 0.45  (~<= 115/255)
 # Яркая зона на robust (мягче)
 ROBUST_HOT_THR = 0.80
 
+# NEW: цветной шум — минимальная «хрома» и адаптивный порог по квантилю
+CHROMA_MIN = 0.18    # базовый минимум 0..1 (если документ «плоский»)
+CHROMA_Q   = 90      # берём макс(CHROMA_MIN, q-квантиль по карте хромы)
+
 # Фильтры для подсчёта (борьба с шумом и бликами по краям)
-BORDER_INSET = 0.01           # срез 1% по периметру
-MIN_BLOB_AREA_RATIO = 0.00005 # ≥0.005% площади кадра
-MIN_BLOB_AREA_ABS   = 64      # и не меньше 64 пикселей
+BORDER_INSET = 0.01            # срез 1% по периметру
+MIN_BLOB_AREA_RATIO = 0.00005  # ≥0.005% площади кадра
+MIN_BLOB_AREA_ABS   = 64       # и не меньше 64 пикселей
 
 # DEBUG: сохранять ли диагностические маски
 DEBUG_SAVE_MASKS = True
@@ -82,6 +86,18 @@ def ela_ensemble_rgb(pil_img: Image.Image) -> np.ndarray:
         mx = 1.0
     ela_rgb = np.clip(ela_rgb * (255.0 / mx), 0, 255)
     return ela_rgb.astype(np.uint8)
+
+# ===== Карта «цветного шума» (хрома) =====
+
+def chroma_energy(rgb_u8: np.ndarray) -> np.ndarray:
+    """
+    Энергия цветного шума: Ec = sqrt((R-G)^2 + (R-B)^2 + (G-B)^2) / (sqrt(3)*255).
+    Диапазон 0..1. На чистой бумаге низкая, у «цветных» спеклов заметно выше.
+    """
+    x = rgb_u8.astype(np.float32)
+    R, G, B = x[:, :, 0], x[:, :, 1], x[:, :, 2]
+    ec = np.sqrt((R - G) ** 2 + (R - B) ** 2 + (G - B) ** 2) / (np.sqrt(3) * 255.0)
+    return np.clip(ec, 0, 1)
 
 # ===== Визуализации (оба — без colormap, чистый RGB шум) =====
 
@@ -131,11 +147,15 @@ def hot_masks_from_fused(classic_rgb_u8: np.ndarray,
                          min_area_abs: int = MIN_BLOB_AREA_ABS
                          ) -> Tuple[float, np.ndarray, float, np.ndarray, float, np.ndarray]:
     """
-    Считает три маски: WHITE (classic по HSV), ROBUST (по яркости robust_norm), FUSED=OR.
-    Применяет обрезку рамки, морфологию и фильтр по площади.
+    Считает три маски: WHITE (classic по HSV), ROBUST (по яркости robust_norm c фильтром по хроме),
+    FUSED = OR. Применяет обрезку рамки, морфологию и фильтр по площади.
     Возвращает: (pct_fused, mask_fused, pct_white, mask_white, pct_robust, mask_robust).
     """
     H, W = classic_rgb_u8.shape[:2]
+
+    # 0) карта цветного шума + адаптивный порог по квантилю
+    ec = chroma_energy(classic_rgb_u8)                              # 0..1
+    ec_thr = max(CHROMA_MIN, float(np.percentile(ec, CHROMA_Q)))    # адаптивно под кадр
 
     # 1) белые пятна на classic (по HSV)
     hsv = cv2.cvtColor(classic_rgb_u8, cv2.COLOR_RGB2HSV)
@@ -143,9 +163,9 @@ def hot_masks_from_fused(classic_rgb_u8: np.ndarray,
     V = hsv[:, :, 2].astype(np.float32) / 255.0
     white_mask = (V >= v_thr) & (S <= s_thr)
 
-    # 2) яркие зоны на robust (немного сгладим)
+    # 2) яркие зоны на robust (слегка сгладим) + фильтр по «цветной» хроме
     rob_smooth = cv2.GaussianBlur(robust_norm.astype(np.float32), (0, 0), 1.0)
-    robust_mask = (rob_smooth >= r_thr)
+    robust_mask = (rob_smooth >= r_thr) & (ec >= ec_thr)
 
     # 3) OR
     fused = (white_mask | robust_mask).astype(np.uint8)
@@ -200,14 +220,19 @@ def _save_debug_masks(pil_img: Image.Image,
                       white_mask: np.ndarray,
                       robust_mask: np.ndarray,
                       out_dir: Path,
-                      stem: str) -> Dict[str, str]:
+                      stem: str,
+                      chroma_mask: np.ndarray | None = None) -> Dict[str, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    names: Dict[str, str] = {}
     # бинарки
-    names = {}
     for name, m in (("white_bin", white_mask), ("robust_bin", robust_mask), ("fused_bin", fused)):
         p = out_dir / f"{stem}_{name}.jpg"
         cv2.imwrite(str(p), (m.astype(np.uint8) * 255), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         names[name] = p.name
+    if chroma_mask is not None:
+        p = out_dir / f"{stem}_chroma_bin.jpg"
+        cv2.imwrite(str(p), (chroma_mask.astype(np.uint8) * 255), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        names["chroma_bin"] = p.name
     # оверлеи на оригинал
     orig_rgb = np.asarray(pil_img.convert("RGB"))
     over_white  = _overlay_mask_on_rgb(orig_rgb, white_mask,  (255, 255, 255))  # белый
@@ -219,6 +244,11 @@ def _save_debug_masks(pil_img: Image.Image,
         p = out_dir / f"{stem}_{name}.jpg"
         cv2.imwrite(str(p), img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         names[name] = p.name
+    if chroma_mask is not None:
+        over_chroma = _overlay_mask_on_rgb(orig_rgb, chroma_mask, (0, 165, 255))  # оранжевый
+        p = out_dir / f"{stem}_chroma_overlay.jpg"
+        cv2.imwrite(str(p), over_chroma, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        names["chroma_overlay"] = p.name
     return names
 
 # ===== Вердикт =====
@@ -236,7 +266,7 @@ def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Di
     """
     Сохраняет оригинал + две цветные ELA-карты (classic и robust),
     считает % артефактов по fusion-маске и отдаёт статус.
-    (Если DEBUG_SAVE_MASKS=True — дополнительно сохраняет маски white/robust/fused.)
+    (Если DEBUG_SAVE_MASKS=True — дополнительно сохраняет маски white/robust/fused/chroma.)
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -269,10 +299,13 @@ def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Di
     )
     verdict, severity = verdict_from_hot_pct(pct_fused)
 
-    # 4) DEBUG-маски (опционально)
+    # 4) DEBUG-маски (опционально) — добавим и хрому
     debug = {}
     if DEBUG_SAVE_MASKS:
-        dbg_names = _save_debug_masks(pil_img, classic_rgb, fused_mask, white_mask, robust_mask, out_dir, stem)
+        ec = chroma_energy(classic_rgb)
+        ec_thr = max(CHROMA_MIN, float(np.percentile(ec, CHROMA_Q)))
+        chroma_mask = (ec >= ec_thr).astype(np.uint8)
+        dbg_names = _save_debug_masks(pil_img, classic_rgb, fused_mask, white_mask, robust_mask, out_dir, stem, chroma_mask)
         to_web_dbg = lambda name: f"/static/results/{Path(name).name}"
         debug = {k: to_web_dbg(v) for k, v in dbg_names.items()}
 
@@ -291,7 +324,8 @@ def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Di
             f"{verdict} — hot≈{pct_fused:.2f}% "
             f"(white≈{pct_white:.2f}%, robust≈{pct_robust:.2f}%; "
             f"classic: V≥{int(WHITE_V_THR*100)}%, S≤{int(WHITE_S_THR*100)}%; "
-            f"robust: ≥{int(ROBUST_HOT_THR*100)}%; border cut {int(BORDER_INSET*100)}%)"
+            f"robust: ≥{int(ROBUST_HOT_THR*100)}%; border cut {int(BORDER_INSET*100)}%; "
+            f"chroma≥max({int(CHROMA_MIN*100)}%, Q{CHROMA_Q}))"
         ),
         "debug":    debug,  # ссылки на маски, если включено
         "report":   ""
