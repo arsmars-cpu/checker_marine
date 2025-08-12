@@ -1,3 +1,4 @@
+# error_level_analysis.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from PIL import Image, ImageChops, ImageEnhance
 
 ELA_QUALS: Tuple[int, ...] = (90, 95, 98)
 
-# Цветной ELA (как в «идеале») — LUT НЕ используем (оставил для экспериментов)
+# Цветной ELA — LUT НЕ используем (оставлен для экспериментов)
 COLORMAP = cv2.COLORMAP_MAGMA
 
 # Robust-нормализация (для второй картинки)
@@ -23,16 +24,21 @@ VIS_P_HI = 98
 ROBUST_GAIN  = 1.6
 ROBUST_GAMMA = 0.9
 
-# Порог и рубрики вердикта (чуть чувствительнее)
+# Порог и рубрики вердикта
 LOW_MAX = 1.0        # <1% — Low
 MID_MAX = 5.0        # 1–5% — Medium, иначе High
 
-# Белая зона на classic = высокая яркость + низкая насыщенность
-WHITE_V_THR = 0.78   # V >= 0.78  (~>= 199/255)
-WHITE_S_THR = 0.38   # S <= 0.38  (~<= 97/255)
+# Белая зона на classic = высокая яркость + низкая насыщенность (строже)
+WHITE_V_THR = 0.86   # V >= 0.86 (~>= 219/255)
+WHITE_S_THR = 0.32   # S <= 0.32 (~<= 82/255)
 
-# Яркая зона на robust
-ROBUST_HOT_THR = 0.78
+# Яркая зона на robust (строже)
+ROBUST_HOT_THR = 0.86
+
+# Фильтры для подсчёта (борьба с шумом и бликами по краям)
+BORDER_INSET = 0.02           # срез 2% по периметру
+MIN_BLOB_AREA_RATIO = 0.0002  # ≥0.02% площади кадра
+MIN_BLOB_AREA_ABS   = 96      # и не меньше 96 пикселей
 
 # ===== Базовые шаги ELA =====
 
@@ -115,21 +121,50 @@ def hot_pct_from_fused(classic_rgb_u8: np.ndarray,
                        robust_norm: np.ndarray,
                        v_thr: float = WHITE_V_THR,
                        s_thr: float = WHITE_S_THR,
-                       r_thr: float = ROBUST_HOT_THR) -> Tuple[float, np.ndarray]:
+                       r_thr: float = ROBUST_HOT_THR,
+                       inset_ratio: float = BORDER_INSET,
+                       min_area_ratio: float = MIN_BLOB_AREA_RATIO,
+                       min_area_abs: int = MIN_BLOB_AREA_ABS) -> Tuple[float, np.ndarray]:
     """
-    Артефакт = (V>=v_thr & S<=s_thr) на classic  OR  (robust_norm>=r_thr).
+    Артефакт = (V>=v_thr & S<=s_thr) на classic  OR  (robust_norm_smooth>=r_thr).
+    Шум чистим морфологией и фильтром по минимальной площади. Рамку по периметру отбрасываем.
     Возвращает (процент, бинарную маску).
     """
+    H, W = classic_rgb_u8.shape[:2]
+
+    # 1) белые пятна на classic (по HSV)
     hsv = cv2.cvtColor(classic_rgb_u8, cv2.COLOR_RGB2HSV)
     S = hsv[:, :, 1].astype(np.float32) / 255.0
     V = hsv[:, :, 2].astype(np.float32) / 255.0
+    white_mask = (V >= v_thr) & (S <= s_thr)
 
-    white_mask  = (V >= v_thr) & (S <= s_thr)
-    robust_mask = (robust_norm >= r_thr)
-    fused = white_mask | robust_mask
+    # 2) яркие зоны на robust (слегка сгладим)
+    rob_smooth = cv2.GaussianBlur(robust_norm.astype(np.float32), (0, 0), 1.0)
+    robust_mask = (rob_smooth >= r_thr)
 
+    fused = (white_mask | robust_mask).astype(np.uint8)
+
+    # 3) срезаем рамку (часто даёт блики/виньетку)
+    b = int(round(min(H, W) * inset_ratio))
+    if b > 0:
+        fused[:b, :] = 0; fused[-b:, :] = 0
+        fused[:, :b] = 0; fused[:, -b:] = 0
+
+    # 4) морфология против «соли-перца»
+    kernel = np.ones((3, 3), np.uint8)
+    fused = cv2.morphologyEx(fused, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # 5) фильтр по площади компонент
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(fused, connectivity=8)
+    keep = np.zeros_like(fused)
+    min_area = max(int(min_area_ratio * H * W), int(min_area_abs))
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            keep[labels == i] = 1
+
+    fused = keep
     hot_pct = float(fused.mean() * 100.0) if fused.size else 0.0
-    return hot_pct, fused.astype(np.uint8)
+    return hot_pct, fused
 
 # ===== Вердикт =====
 
@@ -145,7 +180,7 @@ def verdict_from_hot_pct(hot_pct: float) -> Tuple[str, str]:
 def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Dict:
     """
     Сохраняет оригинал + две цветные ELA-карты (classic и robust),
-    считает % «горячих» пикселей по fusion-маске и отдаёт статус.
+    считает % артефактов по fusion-маске и отдаёт статус.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -172,7 +207,7 @@ def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Di
                 cv2.cvtColor(robust_rgb, cv2.COLOR_RGB2BGR),
                 [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
-    # 3) Метрика/вердикт: fusion classic+robust
+    # 3) Метрика/вердикт: fusion classic+robust с фильтрами
     hot_pct, _ = hot_pct_from_fused(classic_rgb, robust_norm)
     verdict, severity = verdict_from_hot_pct(hot_pct)
 
@@ -190,7 +225,8 @@ def run_image(pil_img: Image.Image, label: str, batch: str, out_dir: Path) -> Di
         "summary":  (
             f"{verdict} — hot≈{hot_pct:.2f}%  "
             f"(classic: V≥{int(WHITE_V_THR*100)}%, S≤{int(WHITE_S_THR*100)}%; "
-            f"robust: ≥{int(ROBUST_HOT_THR*100)}%)"
+            f"robust: ≥{int(ROBUST_HOT_THR*100)}%; "
+            f"border cut {int(BORDER_INSET*100)}%)"
         ),
         "report":   ""
     }
